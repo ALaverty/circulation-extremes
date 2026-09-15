@@ -5,8 +5,8 @@ The associated datasets which this code uses are stored in the following open-ac
 
 The code stored here is organized into discrete sections of processing and analysis, as follows: 
 - Processing of Geopotential Height (z500) data: detrending, climatology, anomalies
-- Clustering: k-means clustering process
+- Clustering: k-means clustering of z500 data
 - Processing of Temperature data: 
 - Processing of Precipitation data:
 - Identifying Compound Extremes:
-- Figures and Analysis: 
+- Figures and Analysis:
