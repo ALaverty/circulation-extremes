@@ -1,6 +1,4 @@
-# This script processes all the ERA5 temperature data from a seasonal quadratic detrending by grid cell, to climatology calculations (1991-2020)
-# to the calculation of anomalies and zscores, and a trend analysis over 1940-2024. 
-# The timeseries uses Sen's slope with Hamed-Rao modified Mann-Kendall on the area-weighted regional mean. 
+# This script processes all the ERA5 temperature data, executing a seasonal quadratic detrending by grid cell, climatology calculations (1991-2020), and anomalies and zscores calculations.
 # Usage: python temperature_processing.py all tmax
 
 import gc
