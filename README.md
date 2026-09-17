@@ -3,9 +3,9 @@
 This repository  contains code for the manuscript titled "Linking Large-Scale Atmospheric Circulation Regimes and Compound Weather Extremes across Western North America" by Laverty et al. (2026). The associated datasets which this code uses are stored in the following open-access repository: https:XXX. 
 
 The code stored here is organized into discrete sections of processing and analysis, as follows: 
-- Processing of Geopotential Height (z500) data: detrending, climatology, anomalies, k-means clustering, composites
-- Processing of Temperature data: detrending, climatology, anomalies, composites, trends
-- Processing of Precipitation data: gamma fitting, climatology, anomalies, composites, trends
+- Processing of Geopotential Height (z500) data: detrending, climatology, anomalies, k-means clustering
+- Processing of Temperature data: detrending, climatology, anomalies
+- Processing of Precipitation data: gamma fitting, climatology, anomalies
 - Identifying Compound Extremes: climatology frequencies, anomalies
 - Figures and Analysis: 
 
