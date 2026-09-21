@@ -1,6 +1,6 @@
-
 # This script processes all the ERA5 temperature data, executing a seasonal quadratic detrending by grid cell, climatology calculations (1991-2020), and anomalies and zscores calculations.
-# Usage: python temperature_processing.py all tmax
+# This is for both raw and detrended temperature
+# Usage: python temperature_processing.py all tmax OR python temperature_processing.py all tmax --raw
 
 import gc
 import glob
@@ -9,16 +9,15 @@ import re
 import sys
 import time
 import warnings
-
 import numpy as np
 import pandas as pd
 import xarray as xr
-
 warnings.filterwarnings('ignore')
 
 BASE = '/data/lab/singh/amanda/python_codes/era_updated'
 ERA5 = '/data/lab/singh/data/ERA5_updated'
 OUT = f'{BASE}/processed/temperature'
+RAW_OUT = f'{BASE}/processed/temperature_raw'
 
 LAT, LON = 'latitude', 'longitude'
 LAT_MIN, LAT_MAX = 20, 80
@@ -39,6 +38,14 @@ SEASONS = {'DJF': [12, 1, 2], 'MAM': [3, 4, 5],
 SEASON_KEY = {'DJF': 'winter', 'MAM': 'spring', 'JJA': 'summer', 'SON': 'fall'}
 MONTH_SEASON = {m: s for s, ms in SEASONS.items() for m in ms}
 
+def paths(var, raw):
+    root = RAW_OUT if raw else OUT
+    tag = '_raw' if raw else ''
+    return {'root': root,
+            'clim': f'{root}/{var}{tag}_climatology.nc',
+            'std': f'{root}/{var}{tag}_std_dayofyear.nc',
+            'anom': f'{root}/{var}{tag}_{{season}}_anomalies.nc',
+            'zscore': f'{root}/{var}{tag}_{{season}}_zscore.nc'}
 
 def discover_years(var, root=None, suffix=''):
     pat = (f'{root or f"{ERA5}/{var}"}/daily_*_{var}{suffix}.nc')
@@ -68,6 +75,7 @@ def load_year(var, year, detrended=False):
             return None
         units = str(da.attrs.get('units', '')).lower()
         da = da.load()
+    # Prefer the units attribute; fall back to one slice, not the whole year.
     if units.startswith('k') or float(da.isel(valid_time=0).mean()) > 100:
         da = da - 273.15
     return da
@@ -106,7 +114,6 @@ def stage_detrend(var):
     os.makedirs(out_dir, exist_ok=True)
     print(f'  {len(years)} years: {years[0]}-{years[-1]}')
 
-    # pass 1: per-season, per-season-year mean field
     acc, lats, lons = {s: {} for s in SEASONS}, None, None
     for k, yr in enumerate(years):
         if k % 10 == 0:
@@ -131,7 +138,6 @@ def stage_detrend(var):
         del da, vals
         gc.collect()
 
-    # pass 2: one polyfit per season over all grid cells at once.
     fits = {}
     for s in SEASONS:
         sy_all = np.array(sorted(acc[s]), dtype=int)
@@ -175,7 +181,6 @@ def stage_detrend(var):
         print('    no seasons fitted - aborting')
         return
 
-    # pass 3: subtract each season's correction from that season's days
     ref = min(f['first'] for f in fits.values())
     uncorrected = 0
     for k, yr in enumerate(years):
@@ -214,8 +219,10 @@ def stage_detrend(var):
         print(f'    WARNING: {uncorrected:,} days had no matching season-year '
               'fit and were left uncorrected')
 
-def stage_clim(var):
-    clim_fp, std_fp = f'{OUT}/{var}_climatology.nc', f'{OUT}/{var}_std_dayofyear.nc'
+def stage_clim(var, raw=False):
+    pth = paths(var, raw)
+    os.makedirs(pth['root'], exist_ok=True)
+    clim_fp, std_fp = pth['clim'], pth['std']
     if os.path.exists(clim_fp) and os.path.exists(std_fp):
         print('  climatology and std present - skipped')
         return
@@ -223,7 +230,7 @@ def stage_clim(var):
 
     md_list, s1, s2, cnt, lats, lons = None, None, None, None, None, None
     for yr in range(CLIM_START, CLIM_END + 1):
-        da = load_year(var, yr, detrended=True)
+        da = load_year(var, yr, detrended=not raw)
         if da is None:
             print(f'    WARNING: {yr} missing')
             continue
@@ -256,9 +263,9 @@ def stage_clim(var):
         raise RuntimeError('calendar days have unequal sample sizes; the '
                            'pooled recipe assumes they are equal')
 
-    # Pooled centred 31-day mean, wrapped circularly
     n_win = window_sum(cnt)
     clim = window_sum(s1) / n_win[:, None, None]
+
     a1 = window_sum(s1 - cnt[:, None, None] * clim)
     a2 = window_sum(s2 - 2 * clim * s1 + cnt[:, None, None] * clim ** 2)
     var_ = (a2 - a1 ** 2 / n_win[:, None, None]) / (n_win[:, None, None] - 1)
@@ -273,7 +280,8 @@ def stage_clim(var):
         da = xr.DataArray(arr.astype(np.float32),
                           coords={'monthday': md_list, LAT: lats, LON: lons},
                           dims=['monthday', LAT, LON], name=name)
-        da = xr.concat([da, da.sel(monthday=228).assign_coords(monthday=229)], # 29 Feb takes the smoothed 28 Feb field 
+        # 29 Feb takes the smoothed 28 Feb field so daily lookups resolve.
+        da = xr.concat([da, da.sel(monthday=228).assign_coords(monthday=229)],
                        dim='monthday').sortby('monthday')
         da.attrs.update(attrs)
         return da
@@ -287,7 +295,8 @@ def stage_clim(var):
               'units': 'degrees_Celsius',
               'created': pd.Timestamp.now().isoformat()}
     to_da(clim, 'clim', dict(common, title=f'Detrended {var.upper()} climatology',
-                             data_source='season-detrended')).to_netcdf(clim_fp)
+                             data_source='raw' if raw else 'season-detrended')
+          ).to_netcdf(clim_fp)
     to_da(std, 'std_dev', dict(common, min_std_floor=MIN_STD,
                                title=f'Day-of-year std of {var.upper()} anomalies',
                                long_name='pooled day-of-year standard deviation')
@@ -303,32 +312,35 @@ def stage_clim(var):
         print(f'      {s}: '
               f'{float(np.average(f[fin], weights=np.broadcast_to(w, f.shape)[fin])):.2f}')
 
-def stage_anom(var):
-    outs = [f'{OUT}/{var}_{SEASON_KEY[s]}_{k}.nc'
-            for s in SEASONS for k in ('anomalies', 'zscore')]
+def stage_anom(var, raw=False):
+    pth = paths(var, raw)
+    os.makedirs(pth['root'], exist_ok=True)
+    outs = [pth[k].format(season=SEASON_KEY[s])
+            for s in SEASONS for k in ('anom', 'zscore')]
     if all(os.path.exists(f) for f in outs):
         print('  seasonal anomaly and z-score files present - skipped')
         return
-    clim_fp, std_fp = f'{OUT}/{var}_climatology.nc', f'{OUT}/{var}_std_dayofyear.nc'
+    clim_fp, std_fp = pth['clim'], pth['std']
     if not (os.path.exists(clim_fp) and os.path.exists(std_fp)):
         print('  climatology or std missing - run the clim stage first')
         return
     clim = xr.open_dataarray(clim_fp)
     std = xr.open_dataarray(std_fp)
 
-    years = discover_years(var, f'{OUT}/{var}', '_detrended')
+    years = (discover_years(var) if raw
+             else discover_years(var, f'{OUT}/{var}', '_detrended'))
     print(f'  {len(years)} years: {years[0]}-{years[-1]}')
     tmp = []
     for k, yr in enumerate(years):
         if k % 10 == 0:
             print(f'    year {k + 1}/{len(years)} ({yr})')
-        da = load_year(var, yr, detrended=True)
+        da = load_year(var, yr, detrended=not raw)
         if da is None:
             continue
         md = monthday_of(pd.to_datetime(da.valid_time.values))
         anom = (da - align(clim, md, da)).drop_vars('monthday', errors='ignore')
         z = (anom / align(std, md, da)).drop_vars('monthday', errors='ignore')
-        fp = f'{OUT}/_tmp_{var}_{yr}.nc'
+        fp = f"{pth['root']}/_tmp_{var}_{yr}.nc"
         xr.Dataset({'anomalies': anom, 'zscore': z}).to_netcdf(fp)
         tmp.append(fp)
         del da, anom, z
@@ -337,10 +349,10 @@ def stage_anom(var):
     for s, months in SEASONS.items():
         key = SEASON_KEY[s]
         parts = [xr.open_dataset(f) for f in tmp]
-        sel = [p.isel(valid_time=np.flatnonzero(
-            np.isin(pd.to_datetime(p.valid_time.values).month, months)))
-            for p in parts]
-        combined = xr.concat([p for p in sel if p.sizes['valid_time']],
+        sel = [part.isel(valid_time=np.flatnonzero(
+            np.isin(pd.to_datetime(part.valid_time.values).month, months)))
+            for part in parts]
+        combined = xr.concat([d for d in sel if d.sizes['valid_time']],
                              dim='valid_time').sortby('valid_time')
         times = pd.to_datetime(combined.valid_time.values)
         _, syears = season_labels(times)
@@ -355,13 +367,15 @@ def stage_anom(var):
                 'method': ('detrended minus day-of-year climatology'
                            if kind == 'anomalies' else
                            '(detrended - climatology) / day-of-year std'),
-                'detrending': 'seasonal quadratic, per grid cell',
+                'detrending': ('none (raw)' if raw else
+                               'seasonal quadratic, per grid cell'),
                 'season_year_definition': ('Dec(y-1)+Jan(y)+Feb(y)'
                                            if DJF_SHIFT_DECEMBER
                                            else 'calendar year'),
                 'climatology_period': f'{CLIM_START}-{CLIM_END}',
                 'units': unit, 'created': pd.Timestamp.now().isoformat()})
-            da.to_netcdf(f'{OUT}/{var}_{key}_{kind}.nc')
+            da.to_netcdf(pth['anom' if kind == 'anomalies' else 'zscore']
+                         .format(season=key))
 
         ref = (times.year >= CLIM_START) & (times.year <= CLIM_END)
         zr = combined['zscore'].isel(
@@ -372,8 +386,8 @@ def stage_anom(var):
               f'per-cell std median={float(cell_std.median()):.3f} '
               f'(p25 {float(cell_std.quantile(0.25)):.3f}, '
               f'p75 {float(cell_std.quantile(0.75)):.3f})  (expect ~0 and ~1)')
-        for p in parts:
-            p.close()
+        for part in parts:
+            part.close()
         del parts, sel, combined
         gc.collect()
 
@@ -382,31 +396,40 @@ def stage_anom(var):
             os.remove(f)
         except OSError:
             pass
-
+        
 STAGES = {'detrend': stage_detrend, 'clim': stage_clim, 'anom': stage_anom}
+RAW_STAGES = ['clim', 'anom']   # nothing to detrend on the raw branch
 
 def main():
     t0 = time.time()
     args = sys.argv[1:]
+    raw = '--raw' in args
+    args = [a for a in args if a != '--raw']
     stage = args[0] if args and args[0] in list(STAGES) + ['all'] else 'all'
     variables = [a for a in args if a in ('tmax', 'tmin')] or ['tmax', 'tmin']
-    todo = list(STAGES) if stage == 'all' else [stage]
+    todo = (RAW_STAGES if raw else list(STAGES)) if stage == 'all' else [stage]
+    if raw and 'detrend' in todo:
+        print('  note: the raw branch has nothing to detrend; skipping that stage')
+        todo = [t for t in todo if t != 'detrend']
 
     os.makedirs(OUT, exist_ok=True)
     print('=' * 66)
     print(f'  TEMPERATURE PIPELINE  |  stages: {", ".join(todo)}  |  '
-          f'variables: {", ".join(variables)}')
+          f'variables: {", ".join(variables)}  |  '
+          f'{"RAW (not detrended)" if raw else "detrended"}')
     print(f'  DJF: {"Dec(y-1)+Jan(y)+Feb(y)" if DJF_SHIFT_DECEMBER else "Jan+Feb+Dec, same calendar year"}')
     print('=' * 66)
 
     for var in variables:
         for name in todo:
-            print(f'\n{"-" * 66}\n{var.upper()} - {name}\n{"-" * 66}')
-            STAGES[name](var)
+            print(f'\n{"-" * 66}\n{var.upper()} - {name}'
+                  f'{" (raw)" if raw else ""}\n{"-" * 66}')
+            STAGES[name](var) if name == 'detrend' else STAGES[name](var, raw)
 
     print(f'\n{"=" * 66}')
     print(f'  COMPLETE - {(time.time() - t0) / 60:.1f} minutes')
     print('=' * 66)
+
 
 if __name__ == '__main__':
     main()
