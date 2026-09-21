@@ -1,6 +1,7 @@
-# This script processes all the ERA5 temperature data, executing a seasonal quadratic detrending by grid cell, climatology calculations (1991-2020), and anomalies and zscores calculations.
-# This is for both raw and detrended temperature
-# Usage: python temperature_processing.py all tmax OR python temperature_processing.py all tmax --raw
+# This script processes z500 geopotential height data, detrends using a quadratic fit per season to the area-weighted domain-mean seasonal series.
+# It creates a climatology (1991-2020 with a 31-day moving average) and anomalies (detrended data - climatology). 
+# Finally, it uses k-means clustering on seasonal data to identify the typical circulation regimes by season.
+# Usage: python z500_regimes.py <season> [k]    # season: 0=winter 1=spring 2=summer 3=fall
 
 import gc
 import glob
@@ -12,424 +13,589 @@ import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 warnings.filterwarnings('ignore')
 
-BASE = '/data/lab/singh/amanda/python_codes/era_updated'
-ERA5 = '/data/lab/singh/data/ERA5_updated'
-OUT = f'{BASE}/processed/temperature'
-RAW_OUT = f'{BASE}/processed/temperature_raw'
+PATH = '/data/lab/singh/amanda/python_codes/era_updated'
+ERA5 = '/data/lab/singh/data/ERA5_updated/Z500'
 
 LAT, LON = 'latitude', 'longitude'
-LAT_MIN, LAT_MAX = 20, 80
+LAT_MIN, LAT_MAX = 20, 80            # regional trend domain
 LON_MIN, LON_MAX = 190, 260
+HEMI_LAT_MIN, HEMI_LAT_MAX = 0, 90   # hemispheric trend domain
 
-FIT_DEGREE = 2
+BASELINE_YEAR, TREND_DEGREE = 1940, 2
+WINDOW_SIZE = 31
 CLIM_START, CLIM_END = 1991, 2020
-WINDOW = 31
-MIN_STD = 0.1                 
-MIN_YEARS_FOR_FIT = 10
-MIN_DAYS_PER_SEASON = 80   # a complete season is ~90 days
+MIN_DAYS_PER_SEASON = 80             # a complete season is ~90 days
+BLOCK = 500                          # days in memory during the anomaly calculations
+SAVE_COMPOSITES = True               # nc/<season>_cluster<k>_composite.nc
+SAVE_ANOMALIES = True                # processed/<season>_anomalies_for_clustering.nc
+SAVE_PERSISTENCE = True              # csv/<season>_pattern_persistence.csv
+MAX_STREAK_DAYS = 90               
 
-# DJF as Dec(y-1)+Jan(y)+Feb(y)
-DJF_SHIFT_DECEMBER = True
+SEASONS = ['DJF', 'MAM', 'JJA', 'SON']
+SEASON_OF_MONTH = {12: 'DJF', 1: 'DJF', 2: 'DJF', 3: 'MAM', 4: 'MAM', 5: 'MAM',
+                   6: 'JJA', 7: 'JJA', 8: 'JJA', 9: 'SON', 10: 'SON', 11: 'SON'}
 
-SEASONS = {'DJF': [12, 1, 2], 'MAM': [3, 4, 5],
-           'JJA': [6, 7, 8], 'SON': [9, 10, 11]}
-SEASON_KEY = {'DJF': 'winter', 'MAM': 'spring', 'JJA': 'summer', 'SON': 'fall'}
-MONTH_SEASON = {m: s for s, ms in SEASONS.items() for m in ms}
+SEASON_KEYS = {'winter': 'DJF', 'spring': 'MAM', 'summer': 'JJA', 'fall': 'SON'}
+MONTHS = {'DJF': [12, 1, 2], 'MAM': [3, 4, 5], 'JJA': [6, 7, 8], 'SON': [9, 10, 11]}
+SCALE = {'winter': 280, 'spring': 180, 'summer': 140, 'fall': 200}
+SEASON_COLOR = {'DJF': '#4C72B0', 'MAM': '#55A868', 'JJA': '#C44E52', 'SON': '#DD8452'}
 
-def paths(var, raw):
-    root = RAW_OUT if raw else OUT
-    tag = '_raw' if raw else ''
-    return {'root': root,
-            'clim': f'{root}/{var}{tag}_climatology.nc',
-            'std': f'{root}/{var}{tag}_std_dayofyear.nc',
-            'anom': f'{root}/{var}{tag}_{{season}}_anomalies.nc',
-            'zscore': f'{root}/{var}{tag}_{{season}}_zscore.nc'}
+REG_TREND = f'{PATH}/processed/regional_trend_data.nc'
+HEMI_TREND = f'{PATH}/processed/hemispheric_trend_data_hemi.nc'
+DETRENDED = f'{PATH}/processed/detrended_raw_data.nc'
+CLIM = f'{PATH}/processed/climatology.nc'
+COMPARE_FIG = f'{PATH}/plots/seasonal_detrending_timeseries.png'
+COMPARE_CSV = f'{PATH}/csv/seasonal_detrending_stats.csv'
 
-def discover_years(var, root=None, suffix=''):
-    pat = (f'{root or f"{ERA5}/{var}"}/daily_*_{var}{suffix}.nc')
-    return sorted({int(m) for m in
-                   re.findall(r'daily_(\d{4})_', ' '.join(glob.glob(pat)))})
+for sub in ['processed', 'nc', 'csv', 'plots']:
+    os.makedirs(f'{PATH}/{sub}', exist_ok=True)
 
-def _subset(ds):
-    lat = ds[LAT].values
-    sl = slice(LAT_MAX, LAT_MIN) if lat[0] > lat[-1] else slice(LAT_MIN, LAT_MAX)
-    return ds.sel({LAT: sl, LON: slice(LON_MIN, LON_MAX)})
+def open_da(path):
+    ds = xr.open_dataset(path)
+    if 'z' in ds.data_vars:
+        return ds['z']
+    cand = [v for v in ds.data_vars if len(ds[v].dims) >= 2]
+    if not cand:
+        raise KeyError(f'no data variable found in {path}')
+    return ds[cand[0]]
 
-def _pick(sub, var):
-    for nm in ('t2m', var):
-        if nm in sub.data_vars:
-            return sub[nm]
-    cands = [v for v in sub.data_vars if len(sub[v].dims) == 3]
-    return sub[cands[0]] if cands else None
+def load_z(year, lat_rng, lon_rng=None):
+    sel = {LAT: slice(lat_rng[1], lat_rng[0])}
+    if lon_rng is not None:
+        sel[LON] = slice(lon_rng[0], lon_rng[1])
+    with xr.open_dataset(f'{ERA5}/daily_{year}_Z500.nc') as full:
+        ds = full.sel(sel)
+        if ds.sizes.get('pressure_level') == 1:
+            ds = ds.squeeze('pressure_level')
+        return (ds['z'] / 9.80665).load()   
 
-def load_year(var, year, detrended=False):
-    fp = (f'{OUT}/{var}/daily_{year}_{var}_detrended.nc' if detrended
-          else f'{ERA5}/{var}/daily_{year}_{var}.nc')
-    if not os.path.exists(fp):
-        return None
-    with xr.open_dataset(fp) as ds:
-        da = _pick(_subset(ds), var)
-        if da is None:
-            return None
-        units = str(da.attrs.get('units', '')).lower()
-        da = da.load()
-    # Prefer the units attribute; fall back to one slice, not the whole year.
-    if units.startswith('k') or float(da.isel(valid_time=0).mean()) > 100:
-        da = da - 273.15
-    return da
-
-def season_labels(times):
-    months, years = times.month.values, times.year.values.astype(int)
-    seasons = np.array([MONTH_SEASON[m] for m in months])
-    syears = years.copy()
-    if DJF_SHIFT_DECEMBER:
-        syears[months == 12] += 1
-    return seasons, syears
-
-def monthday_of(times):
-    return (times.month * 100 + times.day).values
-
-def window_sum(arr, window=WINDOW):
-    h = window // 2
-    out = np.zeros_like(arr, dtype=float)
-    for k in range(-h, h + 1):
-        out += np.roll(arr, -k, axis=0)
-    return out
-
-def align(field, monthday, template):
-    return field.sel(monthday=xr.DataArray(
-        monthday, dims='valid_time', coords={'valid_time': template.valid_time}))
-
-def stage_detrend(var):
-    out_dir = f'{OUT}/{var}'
-    years = discover_years(var)
+def discover_years():
+    files = ' '.join(glob.glob(f'{ERA5}/daily_*_Z500.nc'))
+    years = sorted(set(re.findall(r'daily_(\d{4})_Z500\.nc', files)))
     if not years:
-        print(f'  no raw files under {ERA5}/{var}/ - skipped')
-        return
-    if len(discover_years(var, out_dir, '_detrended')) == len(years):
-        print(f'  detrended files present ({len(years)} years) - skipped')
-        return
-    os.makedirs(out_dir, exist_ok=True)
-    print(f'  {len(years)} years: {years[0]}-{years[-1]}')
+        raise FileNotFoundError(f'no ERA5 files matched in {ERA5}')
+    print(f'Found {len(years)} years: {years[0]}-{years[-1]}')
+    return years
 
-    acc, lats, lons = {s: {} for s in SEASONS}, None, None
-    for k, yr in enumerate(years):
-        if k % 10 == 0:
-            print(f'    means, year {k + 1}/{len(years)} ({yr})')
-        da = load_year(var, yr)
-        if da is None:
-            continue
-        if lats is None:
-            lats, lons = da[LAT].values, da[LON].values
-        seasons, syears = season_labels(pd.to_datetime(da.valid_time.values))
-        vals = da.values
-        for s in SEASONS:
-            sel = seasons == s
-            for sy in np.unique(syears[sel]) if sel.any() else []:
-                m = sel & (syears == sy)
-                tot, cnt = np.nansum(vals[m], axis=0), int(m.sum())
-                if sy in acc[s]:
-                    acc[s][sy][0] += tot
-                    acc[s][sy][1] += cnt
-                else:
-                    acc[s][sy] = [tot, cnt]
-        del da, vals
-        gc.collect()
+def domain_mean(years, lat_rng, lon_rng=None):
+    out = []
+    for i, y in enumerate(years):
+        if i % 10 == 0:
+            print(f'  year {i + 1}/{len(years)}: {y}')
+        z = load_z(y, lat_rng, lon_rng)
+        w = np.cos(np.deg2rad(z[LAT]))
+        out.append(z.weighted(w).mean([LAT, LON]))
+        del z
+    return xr.concat(out, dim='valid_time').sortby('valid_time')
 
-    fits = {}
+def season_frame(daily):
+    df = pd.DataFrame({'time': pd.to_datetime(daily.valid_time.values),
+                       'v': np.asarray(daily.values, dtype=float)})
+    df['month'] = df['time'].dt.month
+    df['season'] = df['month'].map(SEASON_OF_MONTH)
+    df['season_year'] = np.where(df['month'] == 12, df['time'].dt.year + 1,
+                                 df['time'].dt.year)
+    return df.sort_values('time').reset_index(drop=True)
+
+def fit_seasonal_trends(df):
+    fits, offsets = {}, {}
     for s in SEASONS:
-        sy_all = np.array(sorted(acc[s]), dtype=int)
-        days = np.array([acc[s][y][1] for y in sy_all], dtype=int)
-        complete = days >= MIN_DAYS_PER_SEASON
-        sy_fit = sy_all[complete]
-        if len(sy_fit) < MIN_YEARS_FOR_FIT:
-            print(f'    {s}: only {len(sy_fit)} complete season-years '
-                  '- not fitted')
-            continue
+        g = df[df['season'] == s].groupby('season_year')['v'].agg(['mean', 'size'])
+        complete = g[g['size'] >= MIN_DAYS_PER_SEASON]
+        partial = list(g.index[g['size'] < MIN_DAYS_PER_SEASON].astype(int))
 
-        stack = np.array([acc[s][y][0] / acc[s][y][1] for y in sy_fit],
-                         dtype=float)
-        nlat, nlon = stack.shape[1:]
-        x_fit = (sy_fit - sy_fit[0]).astype(float)
-        y2 = stack.reshape(len(sy_fit), -1)
-        coeffs = np.polyfit(x_fit, y2, FIT_DEGREE)
+        x = complete.index.values.astype(float) - BASELINE_YEAR
+        y = complete['mean'].values.astype(float)
+        coeffs = np.polyfit(x, y, TREND_DEGREE)
+        base = float(np.polyval(coeffs, 0.0))
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        r2 = float(1 - np.sum((y - np.polyval(coeffs, x)) ** 2) / ss_tot) if ss_tot else np.nan
 
-        fitted = np.polyval(coeffs, x_fit[:, None])
-        ss_res = np.nansum((y2 - fitted) ** 2, axis=0)
-        ss_tot = np.nansum((y2 - np.nanmean(y2, axis=0)) ** 2, axis=0)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            r2 = 1.0 - ss_res / ss_tot
+        for sy in g.index.values:
+            offsets[(s, int(sy))] = float(np.polyval(coeffs, sy - BASELINE_YEAR) - base)
 
-        x_all = (sy_all - sy_fit[0]).astype(float)
-        rel = (np.polyval(coeffs, x_all[:, None])
-               - np.polyval(coeffs, 0.0)).reshape(len(sy_all), nlat, nlon)
+        fits[s] = dict(coeffs=coeffs, base=base, r2=r2, means=g['mean'].values,
+                       season_years=g.index.values.astype(int))
+        last = int(g.index.values[-1])
+        note = f', extrapolated for incomplete {partial}' if partial else ''
+        print(f'  {s}: n = {len(complete)} seasons, R2 = {r2:.4f}, '
+              f'offset at {last} = {offsets[(s, last)]:+.2f} m{note}')
+    return fits, offsets
 
-        fits[s] = {'idx': {int(y): i for i, y in enumerate(sy_all)},
-                   'rel': rel.astype(np.float32), 'first': int(sy_fit[0])}
-        dropped = [(int(y), int(d)) for y, d in zip(sy_all[~complete],
-                                                    days[~complete])]
-        print(f'    {s}: fitted on {len(sy_fit)}/{len(sy_all)} season-years, '
-              f'R2 mean={np.nanmean(r2):.4f} median={np.nanmedian(r2):.4f} | '
-              f'correction at {sy_all[-1]}: {np.nanmin(-rel[-1]):+.2f} to '
-              f'{np.nanmax(-rel[-1]):+.2f} C')
-        if dropped:
-            print(f'      incomplete, extrapolated from the curve '
-                  f'(< {MIN_DAYS_PER_SEASON} days): {dropped}')
-    if not fits:
-        print('    no seasons fitted - aborting')
-        return
+def write_trend_file(path, varname, daily, fits, offsets, attrs):
+    data, coords = {varname: daily}, {}
+    for s in SEASONS:
+        f, dim = fits[s], f'season_year_{s}'
+        data[f'seasonal_means_{s}'] = ((dim,), f['means'])
+        data[f'offset_{s}'] = ((dim,), np.array([offsets[(s, int(y))]
+                                                 for y in f['season_years']]))
+        data[f'coeffs_{s}'] = ((f'poly_{s}',), f['coeffs'])
+        coords[dim] = f['season_years']
+        coords[f'poly_{s}'] = np.arange(TREND_DEGREE + 1)
+        attrs[f'trend_r2_{s}'] = f['r2']
+        attrs[f'baseline_value_{s}'] = f['base']
+    attrs['coeff_order'] = ('numpy.polyfit order: highest power first; '
+                            f'x = season_year - {BASELINE_YEAR}')
+    attrs['created'] = pd.Timestamp.now().isoformat()
+    xr.Dataset(data, coords=coords).assign_attrs(attrs).to_netcdf(path)
 
-    ref = min(f['first'] for f in fits.values())
-    uncorrected = 0
-    for k, yr in enumerate(years):
-        if k % 10 == 0:
-            print(f'    applying, year {k + 1}/{len(years)} ({yr})')
-        da = load_year(var, yr)
-        if da is None:
-            continue
-        seasons, syears = season_labels(pd.to_datetime(da.valid_time.values))
-        vals = da.values.copy()
-        for s, f in fits.items():
-            sel = seasons == s
-            for sy in np.unique(syears[sel]) if sel.any() else []:
-                m = sel & (syears == sy)
-                i = f['idx'].get(int(sy))
-                if i is None:
-                    uncorrected += int(m.sum())
-                else:
-                    vals[m] -= f['rel'][i]
-        ds = xr.DataArray(vals, coords=da.coords, dims=da.dims,
-                          name='t2m').to_dataset(name='t2m')
-        ds.attrs.update({
-            'title': f'Season-detrended {var.upper()} {yr}',
-            'method': 'seasonal_quadratic_detrending',
-            'trend_degree': FIT_DEGREE,
-            'djf_definition': ('Dec(y-1)+Jan(y)+Feb(y)' if DJF_SHIFT_DECEMBER
-                               else 'Jan(y)+Feb(y)+Dec(y), same calendar year'),
-            'reference_year': ref,
-            'units': 'degrees_Celsius',
-            'source': 'ERA5',
-            'created': pd.Timestamp.now().isoformat()})
-        ds.to_netcdf(f'{out_dir}/daily_{yr}_{var}_detrended.nc')
-        del da, vals, ds
-        gc.collect()
-    if uncorrected:
-        print(f'    WARNING: {uncorrected:,} days had no matching season-year '
-              'fit and were left uncorrected')
+def per_day_offsets(trend_file, varname):
+    ds = xr.open_dataset(trend_file)
+    df = season_frame(ds[varname])
+    off = {}
+    for s in SEASONS:
+        c = np.asarray(ds[f'coeffs_{s}'].values, dtype=float)
+        base = float(np.polyval(c, 0.0))
+        for sy in df.loc[df['season'] == s, 'season_year'].unique():
+            off[(s, int(sy))] = float(np.polyval(c, sy - BASELINE_YEAR) - base)
+    ds.close()
+    vals = [off[(s, int(sy))] for s, sy in zip(df['season'], df['season_year'])]
+    return pd.Series(vals, index=df['time'])
 
-def stage_clim(var, raw=False):
-    pth = paths(var, raw)
-    os.makedirs(pth['root'], exist_ok=True)
-    clim_fp, std_fp = pth['clim'], pth['std']
-    if os.path.exists(clim_fp) and os.path.exists(std_fp):
-        print('  climatology and std present - skipped')
-        return
-    print(f'  accumulating {CLIM_START}-{CLIM_END} (29 Feb excluded)')
-
-    md_list, s1, s2, cnt, lats, lons = None, None, None, None, None, None
-    for yr in range(CLIM_START, CLIM_END + 1):
-        da = load_year(var, yr, detrended=not raw)
-        if da is None:
-            print(f'    WARNING: {yr} missing')
-            continue
-        times = pd.to_datetime(da.valid_time.values)
-        keep = ~((times.month == 2) & (times.day == 29))
-        da, times = da.isel(valid_time=np.flatnonzero(keep)), times[keep]
-        md = monthday_of(times)
-        if md_list is None:
-            lats, lons = da[LAT].values, da[LON].values
-            md_list = np.array(sorted(set(md)))
-            idx = {int(m): i for i, m in enumerate(md_list)}
-            shape = (len(md_list), len(lats), len(lons))
-            s1, s2 = np.zeros(shape), np.zeros(shape)
-            cnt = np.zeros(len(md_list))
-        vals = da.values.astype(np.float64)
-        for j, m in enumerate(md):
-            i = idx[int(m)]
-            s1[i] += vals[j]
-            s2[i] += vals[j] ** 2
-            cnt[i] += 1
-        del da, vals
+def build_trends(years):
+    if not os.path.exists(REG_TREND):
+        daily = domain_mean(years, (LAT_MIN, LAT_MAX), (LON_MIN, LON_MAX))
+        fits, offsets = fit_seasonal_trends(season_frame(daily))
+        write_trend_file(REG_TREND, 'regional_means_daily', daily, fits, offsets,
+                         {'method': 'seasonal_regional_mean_detrending',
+                          'baseline_year': BASELINE_YEAR,
+                          'trend_degree': TREND_DEGREE,
+                          'trend_domain': f'lat {LAT_MIN}-{LAT_MAX}N, '
+                                          f'lon {LON_MIN}-{LON_MAX}E'})
+        del daily
         gc.collect()
 
-    if md_list is None:
-        print('    no detrended data found - run the detrend stage first')
+    if not os.path.exists(HEMI_TREND):
+        daily = domain_mean(years, (HEMI_LAT_MIN, HEMI_LAT_MAX))
+        fits, offsets = fit_seasonal_trends(season_frame(daily))
+        write_trend_file(HEMI_TREND, 'hemispheric_means_daily', daily, fits, offsets,
+                         {'method': 'seasonal_hemispheric_mean_detrending',
+                          'baseline_year': BASELINE_YEAR,
+                          'trend_degree': TREND_DEGREE,
+                          'trend_domain': f'Northern Hemisphere (lat {HEMI_LAT_MIN}-'
+                                          f'{HEMI_LAT_MAX}N, all longitudes)',
+                          'output_domain': f'Regional (lat {LAT_MIN}-{LAT_MAX}N, '
+                                           f'lon {LON_MIN}-{LON_MAX}E)',
+                          'note': 'fitted for the comparison figure only; '
+                                  'not used to detrend any field'})
+        del daily
+        gc.collect()
+
+def build_detrended(years):
+    if os.path.exists(DETRENDED):
         return
-    print(f'    {len(md_list)} calendar days, {int(cnt.min())}-{int(cnt.max())} '
-          'years each')
-    if cnt.min() != cnt.max():
-        raise RuntimeError('calendar days have unequal sample sizes; the '
-                           'pooled recipe assumes they are equal')
+    offsets = per_day_offsets(REG_TREND, 'regional_means_daily')
+    print(f'  per-day offsets: {len(offsets)} days, '
+          f'{offsets.min():+.2f} to {offsets.max():+.2f} m')
 
-    n_win = window_sum(cnt)
-    clim = window_sum(s1) / n_win[:, None, None]
-
-    a1 = window_sum(s1 - cnt[:, None, None] * clim)
-    a2 = window_sum(s2 - 2 * clim * s1 + cnt[:, None, None] * clim ** 2)
-    var_ = (a2 - a1 ** 2 / n_win[:, None, None]) / (n_win[:, None, None] - 1)
-    std = np.sqrt(np.clip(var_, 0, None))
-    n_low = int(np.sum(std < MIN_STD))
-    if n_low:
-        print(f'    {n_low:,} (monthday, cell) std values below {MIN_STD} C '
-              '- raised to the floor')
-        std = np.maximum(std, MIN_STD)
-
-    def to_da(arr, name, attrs):
-        da = xr.DataArray(arr.astype(np.float32),
-                          coords={'monthday': md_list, LAT: lats, LON: lons},
-                          dims=['monthday', LAT, LON], name=name)
-        # 29 Feb takes the smoothed 28 Feb field so daily lookups resolve.
-        da = xr.concat([da, da.sel(monthday=228).assign_coords(monthday=229)],
-                       dim='monthday').sortby('monthday')
-        da.attrs.update(attrs)
-        return da
-
-    common = {'climatology_period': f'{CLIM_START}-{CLIM_END}',
-              'smoothing_window': WINDOW,
-              'smoothing_method': ('pooled centred 31-day moving average, '
-                                   'wrapped circularly'),
-              'leap_day_handling': ('29 Feb excluded; monthday 229 assigned '
-                                    'the smoothed 28 Feb field'),
-              'units': 'degrees_Celsius',
-              'created': pd.Timestamp.now().isoformat()}
-    to_da(clim, 'clim', dict(common, title=f'Detrended {var.upper()} climatology',
-                             data_source='raw' if raw else 'season-detrended')
-          ).to_netcdf(clim_fp)
-    to_da(std, 'std_dev', dict(common, min_std_floor=MIN_STD,
-                               title=f'Day-of-year std of {var.upper()} anomalies',
-                               long_name='pooled day-of-year standard deviation')
-          ).to_netcdf(std_fp)
-    print(f'    saved: {os.path.basename(clim_fp)}, {os.path.basename(std_fp)}')
-
-    w = np.cos(np.deg2rad(lats))[:, None]
-    print('    area-weighted mean std by season (C):')
-    for s, months in SEASONS.items():
-        sel = np.isin(md_list // 100, months)
-        f = np.nanmean(std[sel], axis=0)
-        fin = np.isfinite(f)
-        print(f'      {s}: '
-              f'{float(np.average(f[fin], weights=np.broadcast_to(w, f.shape)[fin])):.2f}')
-
-def stage_anom(var, raw=False):
-    pth = paths(var, raw)
-    os.makedirs(pth['root'], exist_ok=True)
-    outs = [pth[k].format(season=SEASON_KEY[s])
-            for s in SEASONS for k in ('anom', 'zscore')]
-    if all(os.path.exists(f) for f in outs):
-        print('  seasonal anomaly and z-score files present - skipped')
-        return
-    clim_fp, std_fp = pth['clim'], pth['std']
-    if not (os.path.exists(clim_fp) and os.path.exists(std_fp)):
-        print('  climatology or std missing - run the clim stage first')
-        return
-    clim = xr.open_dataarray(clim_fp)
-    std = xr.open_dataarray(std_fp)
-
-    years = (discover_years(var) if raw
-             else discover_years(var, f'{OUT}/{var}', '_detrended'))
-    print(f'  {len(years)} years: {years[0]}-{years[-1]}')
     tmp = []
-    for k, yr in enumerate(years):
-        if k % 10 == 0:
-            print(f'    year {k + 1}/{len(years)} ({yr})')
-        da = load_year(var, yr, detrended=not raw)
-        if da is None:
-            continue
-        md = monthday_of(pd.to_datetime(da.valid_time.values))
-        anom = (da - align(clim, md, da)).drop_vars('monthday', errors='ignore')
-        z = (anom / align(std, md, da)).drop_vars('monthday', errors='ignore')
-        fp = f"{pth['root']}/_tmp_{var}_{yr}.nc"
-        xr.Dataset({'anomalies': anom, 'zscore': z}).to_netcdf(fp)
-        tmp.append(fp)
-        del da, anom, z
+    for i, y in enumerate(years):
+        if i % 10 == 0:
+            print(f'  year {i + 1}/{len(years)}: {y}')
+        z = load_z(y, (LAT_MIN, LAT_MAX), (LON_MIN, LON_MAX))
+        o = offsets.reindex(pd.to_datetime(z.valid_time.values)).values
+        if np.isnan(o).any():
+            raise RuntimeError(f'{int(np.isnan(o).sum())} days in {y} have no offset')
+        off = xr.DataArray(o, dims=['valid_time'], coords={'valid_time': z.valid_time})
+        f = f'{PATH}/processed/_tmp_detrended_{y}.nc'
+        (z - off).rename('z').to_netcdf(f)
+        tmp.append(f)
+        del z, off
         gc.collect()
 
-    for s, months in SEASONS.items():
-        key = SEASON_KEY[s]
-        parts = [xr.open_dataset(f) for f in tmp]
-        sel = [part.isel(valid_time=np.flatnonzero(
-            np.isin(pd.to_datetime(part.valid_time.values).month, months)))
-            for part in parts]
-        combined = xr.concat([d for d in sel if d.sizes['valid_time']],
-                             dim='valid_time').sortby('valid_time')
-        times = pd.to_datetime(combined.valid_time.values)
-        _, syears = season_labels(times)
-        combined = combined.assign_coords(season_year=('valid_time', syears))
-
-        for kind, unit in (('anomalies', 'degrees_Celsius'),
-                           ('zscore', 'standard_deviations')):
-            da = combined[kind]
-            da.attrs.update({
-                'temperature_type': var, 'season': s, 'months': months,
-                'title': f'{s} {var.upper()} {kind}',
-                'method': ('detrended minus day-of-year climatology'
-                           if kind == 'anomalies' else
-                           '(detrended - climatology) / day-of-year std'),
-                'detrending': ('none (raw)' if raw else
-                               'seasonal quadratic, per grid cell'),
-                'season_year_definition': ('Dec(y-1)+Jan(y)+Feb(y)'
-                                           if DJF_SHIFT_DECEMBER
-                                           else 'calendar year'),
-                'climatology_period': f'{CLIM_START}-{CLIM_END}',
-                'units': unit, 'created': pd.Timestamp.now().isoformat()})
-            da.to_netcdf(pth['anom' if kind == 'anomalies' else 'zscore']
-                         .format(season=key))
-
-        ref = (times.year >= CLIM_START) & (times.year <= CLIM_END)
-        zr = combined['zscore'].isel(
-            valid_time=np.flatnonzero(ref)).astype('float64')
-        cell_std = zr.std('valid_time')
-        print(f'    {key:7s} {s}: {combined.sizes["valid_time"]:,} days | '
-              f'z in reference period: mean={float(zr.mean()):+.3f}, '
-              f'per-cell std median={float(cell_std.median()):.3f} '
-              f'(p25 {float(cell_std.quantile(0.25)):.3f}, '
-              f'p75 {float(cell_std.quantile(0.75)):.3f})  (expect ~0 and ~1)')
-        for part in parts:
-            part.close()
-        del parts, sel, combined
-        gc.collect()
-
+    parts = [xr.open_dataarray(f) for f in tmp]
+    combined = xr.concat(parts, dim='valid_time').sortby('valid_time').rename('z')
+    combined.attrs.update({
+        'title': 'Detrended Z500',
+        'method': 'seasonal_regional_mean_detrending',
+        'baseline_year': BASELINE_YEAR,
+        'trend_degree': TREND_DEGREE,
+        'description': ('Z500 with a spatially uniform, season-specific offset '
+                        'removed; offset from a quadratic fit to the area-weighted '
+                        f'domain-mean seasonal series, referenced to {BASELINE_YEAR}'),
+        'created': pd.Timestamp.now().isoformat()})
+    combined.to_netcdf(DETRENDED)
+    for p in parts:
+        p.close()
     for f in tmp:
-        try:
-            os.remove(f)
-        except OSError:
-            pass
-        
-STAGES = {'detrend': stage_detrend, 'clim': stage_clim, 'anom': stage_anom}
-RAW_STAGES = ['clim', 'anom']   # nothing to detrend on the raw branch
+        os.remove(f)
+    del combined, parts
+    gc.collect()
+
+def build_climatology():
+    if os.path.exists(CLIM):
+        return
+    print(f'\nCLIMATOLOGY ({CLIM_START}-{CLIM_END}, 29 Feb excluded)')
+    det = open_da(DETRENDED).sel(valid_time=slice(f'{CLIM_START}-01-01',
+                                                  f'{CLIM_END}-12-31'))
+    is_feb29 = ((det.valid_time.dt.month == 2) & (det.valid_time.dt.day == 29)).values
+    det = det.isel(valid_time=np.flatnonzero(~is_feb29))
+    md = (det.valid_time.dt.month * 100 + det.valid_time.dt.day).values
+    det = det.assign_coords(monthday=('valid_time', md))
+    print(f'  excluded {int(is_feb29.sum())} leap days; '
+          f'{len(det.valid_time)} days in')
+
+    day_sum = det.groupby('monthday').sum('valid_time')
+    counts = pd.Series(md).value_counts().sort_index()
+    if not np.array_equal(counts.index.values, day_sum.monthday.values):
+        raise RuntimeError('calendar-day counts do not align with the grouped sums')
+    if counts.nunique() != 1:
+        raise RuntimeError('calendar days have unequal sample sizes '
+                           f'({counts.min()}-{counts.max()}); the pooled mean below '
+                           'assumes they are equal')
+    n_per_day = int(counts.iloc[0])
+    print(f'  {len(counts)} calendar days x {n_per_day} years')
+
+    h = WINDOW_SIZE // 2
+    pad = xr.concat([day_sum.isel(monthday=slice(-h, None)), day_sum,
+                     day_sum.isel(monthday=slice(0, h))], dim='monthday')
+    clim = (pad.rolling(monthday=WINDOW_SIZE, center=True).sum()
+               .isel(monthday=slice(h, h + day_sum.sizes['monthday']))
+            / float(WINDOW_SIZE * n_per_day))
+    clim = clim.assign_coords(monthday=day_sum.monthday.values)
+
+    # 29 Feb takes the smoothed 28 Feb field so downstream lookups resolve.
+    clim = xr.concat([clim, clim.sel(monthday=228).assign_coords(monthday=229)],
+                     dim='monthday').sortby('monthday').rename('z')
+    clim.attrs.update({
+        'title': 'Detrended Z500 Climatology',
+        'climatology_period': f'{CLIM_START}-{CLIM_END}',
+        'smoothing_window': WINDOW_SIZE,
+        'smoothing_method': ('pooled centred 31-day moving average of daily values, '
+                             'wrapped circularly across the year boundary'),
+        'leap_day_handling': ('29 Feb excluded; monthday 229 assigned the smoothed '
+                              '28 Feb field'),
+        'created': pd.Timestamp.now().isoformat()})
+    clim.to_netcdf(CLIM)
+    del det, day_sum, pad, clim
+    gc.collect()
+    print(f'Saved: {CLIM}')
+
+
+def linear_fit(x, y):
+    coeffs, cov = np.polyfit(x, y, 1, cov=True)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = 1 - np.sum((y - np.polyval(coeffs, x)) ** 2) / ss_tot if ss_tot else np.nan
+    return float(coeffs[0]), float(np.sqrt(cov[0, 0])), float(r2), coeffs
+
+def comparison_figure():
+    if os.path.exists(COMPARE_FIG) and os.path.exists(COMPARE_CSV):
+        return
+    print('\nCOMPARISON FIGURE (regional vs hemispheric detrending)')
+    reg, hemi = xr.open_dataset(REG_TREND), xr.open_dataset(HEMI_TREND)
+    df = season_frame(reg['regional_means_daily'])
+
+    def offsets_from(ds, s, yrs):
+        c = np.asarray(ds[f'coeffs_{s}'].values, dtype=float)
+        return np.polyval(c, yrs - BASELINE_YEAR) - float(np.polyval(c, 0.0)), c
+
+    rows, panels = [], {}
+    for s in SEASONS:
+        g = df[df['season'] == s].groupby('season_year')['v'].agg(['mean', 'size'])
+        # A December-only "winter mean" is not comparable to a full one.
+        complete = g[g['size'] >= MIN_DAYS_PER_SEASON]
+        yrs = complete.index.values.astype(float)
+        raw = complete['mean'].values.astype(float)
+        span = yrs.max() - yrs.min()
+
+        reg_off, reg_c = offsets_from(reg, s, yrs)
+        hemi_off, _ = offsets_from(hemi, s, yrs)
+        reg_fit = np.polyval(reg_c, yrs - BASELINE_YEAR)
+        reg_det, hemi_det = raw - reg_off, raw - hemi_off
+
+        ss_tot = np.sum((raw - raw.mean()) ** 2)
+        poly_r2 = float(1 - np.sum((raw - reg_fit) ** 2) / ss_tot) if ss_tot else np.nan
+        slope, se, lin_r2, lin_c = linear_fit(yrs, raw)
+
+        rows.append({
+            'season': s,
+            'regional_removed_m': float(reg_off[-1] - reg_off[0]),
+            'hemispheric_removed_m': float(hemi_off[-1] - hemi_off[0]),
+            'difference_m': float((reg_off[-1] - reg_off[0]) - (hemi_off[-1] - hemi_off[0])),
+            'linear_rate_m_per_year': slope, 'linear_rate_se': se,
+            'poly_r2': poly_r2, 'linear_r2': lin_r2,
+            'regional_residual_m': float(linear_fit(yrs, reg_det)[0] * span),
+            'hemispheric_residual_m': float(linear_fit(yrs, hemi_det)[0] * span),
+            'detrended_correlation': float(np.corrcoef(reg_det, hemi_det)[0, 1]),
+            'n_seasons': int(len(complete)),
+            'excluded_season_years': ';'.join(
+                str(d) for d in g.index[g['size'] < MIN_DAYS_PER_SEASON].astype(int))})
+        panels[s] = dict(yrs=yrs, raw=raw, reg_det=reg_det, hemi_det=hemi_det,
+                         reg_fit=reg_fit, lin_fit=np.polyval(lin_c, yrs))
+        print(f'  {s}: regional {rows[-1]["regional_removed_m"]:+.1f} m, '
+              f'hemispheric {rows[-1]["hemispheric_removed_m"]:+.1f} m, '
+              f'r = {rows[-1]["detrended_correlation"]:.4f}')
+
+    stats = pd.DataFrame(rows)
+    stats.to_csv(COMPARE_CSV, index=False)
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    for ax, s in zip(axes.ravel(), SEASONS):
+        d, r = panels[s], stats[stats['season'] == s].iloc[0]
+        ax.plot(d['yrs'], d['raw'], color='black', lw=1.8, label='Raw Data', zorder=4)
+        ax.plot(d['yrs'], d['hemi_det'], color='blue', lw=1.5,
+                label='Hemispheric Detrended', zorder=3)
+        ax.plot(d['yrs'], d['reg_det'], color='green', lw=1.5,
+                label='Regional Detrended', zorder=3)
+        ax.plot(d['yrs'], d['reg_fit'], color='red', ls='--', lw=1.8,
+                label='Polynomial Trend', zorder=2)
+        ax.plot(d['yrs'], d['lin_fit'], color='magenta', ls=':', lw=1.8,
+                label='Linear Trend', zorder=2)
+        ax.text(0.015, 0.985,
+                f'Climate Change Signal:\n'
+                f'\u2022 Linear Rate: {r["linear_rate_m_per_year"]:+.3f} '
+                f'\u00b1 {r["linear_rate_se"]:.3f} m/yr\n'
+                f'\u2022 Polynomial Fit: R\u00b2 = {r["poly_r2"]:.3f}\n'
+                f'\u2022 Linear Fit: R\u00b2 = {r["linear_r2"]:.3f}\n\n'
+                f'Detrending:\n'
+                f'\u2022 Hemispheric Removed: {r["hemispheric_removed_m"]:.1f} m\n'
+                f'\u2022 Regional Removed: {r["regional_removed_m"]:.1f} m\n'
+                f'\u2022 Difference: {r["difference_m"]:+.1f} m\n\n',
+                transform=ax.transAxes, va='top', ha='left', fontsize=8,
+                fontfamily='monospace',
+                bbox=dict(boxstyle='square,pad=0.5', facecolor='white',
+                          edgecolor='black', linewidth=1.0))
+        ax.set_title(s, fontsize=13, fontweight='bold')
+        ax.set_xlabel('Year', fontsize=11)
+        ax.set_ylabel('Seasonal Mean Z500 (m)', fontsize=11)
+        ax.grid(True, color='0.88', linewidth=0.7)
+        ax.set_axisbelow(True)
+        ax.legend(loc='lower right', fontsize=8, framealpha=0.9)
+
+    fig.suptitle('Domain-Wide Seasonal Time Series', fontsize=15, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(COMPARE_FIG, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    reg.close()
+    hemi.close()
+
+def seasonal_anomalies(key):
+    name = SEASON_KEYS[key]
+    det, clim = open_da(DETRENDED), open_da(CLIM)
+    times = pd.to_datetime(det.valid_time.values)
+    idx = np.flatnonzero(np.isin(times.month, MONTHS[name]))
+    if idx.size == 0:
+        raise RuntimeError(f'no {name} days found in {DETRENDED}')
+    season_da = det.isel(valid_time=idx)
+    t = times[idx]
+    md = (t.month * 100 + t.day).values
+
+    nlat, nlon = season_da.sizes[LAT], season_da.sizes[LON]
+    X = np.empty((idx.size, nlat * nlon))
+    print(f'Computing {name} anomalies for {idx.size} days '
+          f'({t[0].date()} to {t[-1].date()})...')
+    for i in range(0, idx.size, BLOCK):
+        sl = slice(i, min(i + BLOCK, idx.size))
+        blk = season_da.isel(valid_time=sl).values - clim.sel(monthday=md[sl]).values
+        X[sl] = blk.reshape(blk.shape[0], -1)
+    np.nan_to_num(X, copy=False)
+    return X, season_da, t, (nlat, nlon)
+
+def apply_remap(labels, key, k):
+    path = f'{PATH}/csv/{key}_cluster_remap.csv'
+    if not os.path.exists(path):
+        return labels
+    lut = pd.read_csv(path, comment='#').set_index('new')['reference'].to_dict()
+    if sorted(lut) != list(range(k)) or sorted(lut.values()) != list(range(k)):
+        raise RuntimeError(f'{path} is not a permutation of 0..{k - 1}; '
+                           'it was derived for a different run')
+    print(f'Applying cluster remap from {path}: {lut}')
+    return np.array([lut[int(l)] for l in labels])
+
+def plot_cluster(ax, anom, raw, title, scale):
+    import cartopy.crs as ccrs
+    from cartopy.io import shapereader
+    from cartopy.feature import ShapelyFeature
+    from matplotlib.colors import TwoSlopeNorm
+    from shapely.geometry import box
+
+    lon0, lon1 = LON_MIN - 360, LON_MAX - 360
+    ax.set_extent([lon0, lon1, LAT_MIN, LAT_MAX], crs=ccrs.PlateCarree())
+    ax.spines['geo'].set_visible(False)
+
+    bounds = box(lon0, LAT_MIN, lon1, LAT_MAX)
+    for shp, cat, color, w in [('admin_1_states_provinces_lakes', 'cultural', 'gray', 0.4),
+                               ('coastline', 'physical', 'black', 0.8)]:
+        reader = shapereader.Reader(shapereader.natural_earth(resolution='50m',
+                                                              category=cat, name=shp))
+        geoms = [g.intersection(bounds) for g in reader.geometries()
+                 if g.intersects(bounds) and not g.intersection(bounds).is_empty]
+        if geoms:
+            ax.add_feature(ShapelyFeature(geoms, ccrs.PlateCarree(), facecolor='none',
+                                          edgecolor=color, linewidth=w), zorder=2)
+
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.7, linestyle='--')
+    gl.top_labels = gl.right_labels = False
+    gl.xlabel_style = gl.ylabel_style = {'size': 8}
+
+    lon_mesh, lat_mesh = np.meshgrid(anom[LON], anom[LAT])
+    lon_mesh = np.where(lon_mesh > 180, lon_mesh - 360, lon_mesh)
+    levels = np.linspace(-scale, scale, 21)
+    cs = ax.contourf(lon_mesh, lat_mesh, anom, levels=levels,
+                     transform=ccrs.PlateCarree(), cmap='RdBu_r',
+                     norm=TwoSlopeNorm(vmin=-scale, vcenter=0, vmax=scale),
+                     extend='both')
+
+    step = 75
+    raw_levels = np.arange(np.floor(float(raw.min()) / step) * step,
+                           np.ceil(float(raw.max()) / step) * step + step, step)
+    cl = ax.contour(lon_mesh, lat_mesh, raw, levels=raw_levels, colors='lightslategray',
+                    linewidths=0.6, transform=ccrs.PlateCarree(), alpha=0.8)
+    ax.clabel(cl, inline=True, fontsize=7, fmt='%1.0f', colors='lightslategray')
+    ax.set_title(title, fontsize=16, pad=10)
+    return cs
+
+def write_persistence(key, assign):
+    df = assign[assign['cluster'] >= 0].sort_values('date').reset_index(drop=True)
+    n_dropped = len(assign) - len(df)
+    if n_dropped:
+        print(f'  persistence: {n_dropped} unassigned days excluded')
+    dates = pd.DatetimeIndex(df['date'])
+    syear = np.where((dates.month == 12) & (key == 'winter'),
+                     dates.year + 1, dates.year)
+
+    rows = []
+    start, cur_c, cur_y = dates[0], df['cluster'].iloc[0], syear[0]
+    for i in range(1, len(df)):
+        gap = (dates[i] - dates[i - 1]).days > 1
+        if df['cluster'].iloc[i] != cur_c or syear[i] != cur_y or gap:
+            end = dates[i - 1]
+            dur = (end - start).days + 1
+            if dur <= MAX_STREAK_DAYS:
+                rows.append(dict(start_date=start, end_date=end,
+                                 cluster_id=int(cur_c), duration=int(dur),
+                                 season_year=int(cur_y)))
+            start, cur_c, cur_y = dates[i], df['cluster'].iloc[i], syear[i]
+    dur = (dates[-1] - start).days + 1
+    if dur <= MAX_STREAK_DAYS:
+        rows.append(dict(start_date=start, end_date=dates[-1],
+                         cluster_id=int(cur_c), duration=int(dur),
+                         season_year=int(cur_y)))
+
+    out = pd.DataFrame(rows)
+    fp = f'{PATH}/csv/{key}_pattern_persistence.csv'
+    out.to_csv(fp, index=False)
+    print(f'  persistence: {len(out):,} streaks, mean '
+          f'{out["duration"].mean():.2f} d, longest {out["duration"].max()} d '
+          f'-> {fp}')
+    
+def cluster_season(key, k):
+    import cartopy.crs as ccrs
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    t0 = time.time()
+    name, scale = SEASON_KEYS[key], SCALE[key]
+    X, season_da, times, (nlat, nlon) = seasonal_anomalies(key)
+    
+    anom_fp = f'{PATH}/processed/{key}_anomalies_for_clustering.nc'
+    if SAVE_ANOMALIES and not os.path.exists(anom_fp):
+        xr.DataArray(X.reshape(len(times), nlat, nlon),
+                     coords={'valid_time': season_da.valid_time,
+                             LAT: season_da[LAT], LON: season_da[LON]},
+                     dims=['valid_time', LAT, LON], name='z'
+                     ).assign_attrs(
+            title=f'{SEASON_KEYS[key]} Z500 anomalies used for clustering',
+            method='detrended minus climatology[monthday]',
+            created=pd.Timestamp.now().isoformat()).to_netcdf(anom_fp)
+        print(f'Saved: {anom_fp}')
+
+    print(f'K-means: {k} clusters on {X.shape[0]} days x {X.shape[1]} gridpoints')
+    labels = KMeans(n_clusters=k, random_state=42, n_init=10, max_iter=300).fit(X).labels_
+    labels = apply_remap(labels, key, k)
+
+    assign = pd.DataFrame({'date': times, 'year': times.year, 'month': times.month,
+                           'season': key, 'cluster': labels})
+    assign.to_csv(f'{PATH}/csv/{key}_all_cluster_assignments.csv', index=False)
+    if SAVE_PERSISTENCE:
+        write_persistence(key, assign)
+
+    grid = lambda a: xr.DataArray(a.reshape(nlat, nlon), dims=(LAT, LON),
+                                  coords={LAT: season_da[LAT], LON: season_da[LON]})
+    global_mean = X.mean(axis=0)
+    total_ss = np.sum((X - global_mean) ** 2)
+
+    info, composites = [], {}
+    for c in range(k):
+        members = np.flatnonzero(labels == c)
+        if members.size == 0:
+            print(f'  cluster {c}: empty')
+            continue
+        print(f'  cluster {c}: {members.size} days')
+
+        anom = grid(X[members].mean(axis=0))
+        raw = season_da.isel(valid_time=members).mean('valid_time')
+        composites[c] = (anom, raw)
+        if SAVE_COMPOSITES:
+            out = xr.Dataset({'Z500_detrended_anomaly': anom, 'Z500_raw': raw})
+            out.attrs['n_members'] = int(members.size)
+            out.to_netcdf(f'{PATH}/nc/{key}_cluster{c}_composite.nc')
+
+        pd.DataFrame({'Dates': times[members], 'Year': times[members].year,
+                      'Month': times[members].month}).to_csv(
+            f'{PATH}/csv/{key}_cluster{c}_dates.csv', index=False)
+
+        between_ss = members.size * np.sum((X[members].mean(axis=0) - global_mean) ** 2)
+        info.append({'Cluster': f'Cluster {c}', 'N_Members': int(members.size),
+                     'Percentage': members.size / X.shape[0] * 100,
+                     'Variance_Contribution': between_ss / total_ss, '_c': c})
+
+    variance = pd.DataFrame(info)[['Cluster', 'Variance_Contribution',
+                                   'N_Members', 'Percentage']]
+    variance.to_csv(f'{PATH}/csv/{key}_variance_metrics.csv', index=False)
+
+    fig = plt.figure(figsize=(4 * len(info), 5))
+    cs = None
+    for i, row in enumerate(info):
+        c = row['_c']
+        ax = fig.add_subplot(1, len(info), i + 1, projection=ccrs.PlateCarree())
+        cs = plot_cluster(ax, *composites[c],
+                          f'Cluster {c}: {row["N_Members"]} days '
+                          f'({row["Percentage"]:.1f}%)', scale)
+    plt.tight_layout(rect=[0, 0.04, 1, 0.97], w_pad=3.0, h_pad=0.5)
+    cbar = fig.colorbar(cs, cax=fig.add_axes([0.1, 0.01, 0.8, 0.04]),
+                        orientation='horizontal', extend='both')
+    cbar.set_label('Z500 Anomaly (m)', fontsize=18)
+    cbar.ax.tick_params(labelsize=16)
+    ticks = np.round(np.linspace(-scale, scale, 11) / 10) * 10
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels([f'{int(t)}' for t in ticks])
+    fig.suptitle(f'{key.capitalize()} Season Z500 Clusters - '
+                 'Regionally Detrended Anomalies\n', fontsize=16, y=0.99)
+    figname = f'{PATH}/plots/{key}_all_clusters_composite_{k}clusters.png'
+    plt.savefig(figname, dpi=300, bbox_inches='tight', pad_inches=0.05,
+                facecolor='white')
+    plt.close()
+
+    total_var = variance['Variance_Contribution'].sum()
+
+    print(f'\n{"="*60}\n{name} | {k} clusters | {X.shape[0]} days | '
+          f'{time.time() - t0:.1f}s\n{"="*60}')
+    print(variance.to_string(index=False))
+    print(f'\nTotal variance explained: {total_var:.4f} ({total_var * 100:.2f}%)')
 
 def main():
-    t0 = time.time()
-    args = sys.argv[1:]
-    raw = '--raw' in args
-    args = [a for a in args if a != '--raw']
-    stage = args[0] if args and args[0] in list(STAGES) + ['all'] else 'all'
-    variables = [a for a in args if a in ('tmax', 'tmin')] or ['tmax', 'tmin']
-    todo = (RAW_STAGES if raw else list(STAGES)) if stage == 'all' else [stage]
-    if raw and 'detrend' in todo:
-        print('  note: the raw branch has nothing to detrend; skipping that stage')
-        todo = [t for t in todo if t != 'detrend']
-
-    os.makedirs(OUT, exist_ok=True)
-    print('=' * 66)
-    print(f'  TEMPERATURE PIPELINE  |  stages: {", ".join(todo)}  |  '
-          f'variables: {", ".join(variables)}  |  '
-          f'{"RAW (not detrended)" if raw else "detrended"}')
-    print(f'  DJF: {"Dec(y-1)+Jan(y)+Feb(y)" if DJF_SHIFT_DECEMBER else "Jan+Feb+Dec, same calendar year"}')
-    print('=' * 66)
-
-    for var in variables:
-        for name in todo:
-            print(f'\n{"-" * 66}\n{var.upper()} - {name}'
-                  f'{" (raw)" if raw else ""}\n{"-" * 66}')
-            STAGES[name](var) if name == 'detrend' else STAGES[name](var, raw)
-
-    print(f'\n{"=" * 66}')
-    print(f'  COMPLETE - {(time.time() - t0) / 60:.1f} minutes')
-    print('=' * 66)
-
+    arg = sys.argv[1] if len(sys.argv) > 1 else '0'
+    if arg == 'prep':
+        years = discover_years()
+        build_trends(years)
+        build_detrended(years)
+        build_climatology()
+        comparison_figure()
+        print('\nPrep complete.')
+        return
+    missing = [f for f in (REG_TREND, DETRENDED, CLIM) if not os.path.exists(f)]
+    if missing:
+        sys.exit('Missing prep output:\n  ' + '\n  '.join(missing)
+                 + '\nRun: python z500_regimes.py prep')
+    key = list(SEASON_KEYS)[int(arg)]
+    cluster_season(key, int(sys.argv[2]) if len(sys.argv) > 2 else 6)
 
 if __name__ == '__main__':
     main()
