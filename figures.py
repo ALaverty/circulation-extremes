@@ -202,7 +202,7 @@ def mark_masked(ax, lon_plot, lat_mesh, mask, size=2.5):
 def panel_label(ax, text, boxed=True):
     kw = dict(bbox=dict(boxstyle='square,pad=0.15', facecolor='white',
                         edgecolor='none', alpha=0.8)) if boxed else {}
-    ax.text(0.02, 0.97, text, transform=ax.transAxes, fontsize=9,
+    ax.text(0.02, 0.97, text, transform=ax.transAxes, fontsize=11,
             fontweight='bold', va='top', ha='left', zorder=10, **kw)
 
 def freq_cmap(vmax=10.0, wet=True):
@@ -359,8 +359,8 @@ FIG1_LAYOUT = dict(size=(19, 18.5),
                    map_hspace=0.04,                   
                    series_hspace=0.40)               
 FIG3_LAYOUT = dict(size=(18, 13),
-                   heights=(1.0, 0.045, 0.14, 1.85), 
-                   outer_hspace=0.10,
+                   heights=(1.0, 0.07, 0.14, 1.85), 
+                   outer_hspace=0.14,
                    box_hspace=0.35)
 DP_LIM = (-5.5, 5.5)
 
@@ -697,7 +697,7 @@ def figure3(season, k, var_tag, thresh=THRESH_MAPS):
                      fontweight='bold', loc='left', pad=8)
 
     for row, (axs, metric, sig_col, ylims, ylabel, offset) in enumerate([
-            (axes_f, 'frequency', 'freq_sig', FREQ_YLIM, 'Frequency (%)', 4),
+            (axes_f, 'frequency', 'freq_sig', FREQ_YLIM, 'Frequency (%)\n', 4),
             (axes_e, 'extent', 'ext_sig', EXT_YLIM,
              'Max Spatial Extent (\u00d710\u00b3 km\u00b2)', 8)]):
         for j, name in enumerate(TYPES):
@@ -726,7 +726,8 @@ def figure3(season, k, var_tag, thresh=THRESH_MAPS):
 
     cb = fig.colorbar(im_wet, cax=fig.add_subplot(g_cb[0]),
                       orientation='horizontal', extend='both')
-    cb.set_label('Change in frequency (% of days)\nGray = masked', fontsize=11)
+    cb.ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}'))
+    cb.set_label('Change in frequency (% of days) | Gray = masked', fontsize=11)
     cb = fig.colorbar(im_dry, cax=fig.add_subplot(g_cb[1]),
                       orientation='horizontal', extend='both')
     cb.set_label('Change in frequency (% of days)', fontsize=11)
@@ -970,7 +971,7 @@ def figure4(season, k, var_tag):
 ALL_SEASONS = ['winter', 'spring', 'summer', 'fall']
 MIN_DAYS_PER_YEAR = 5          
 MIN_YEARS_FOR_TREND = 10
-ROLLING_REGIME = 5
+ROLLING_REGIME = 10
 YLIM_PCTL = (0.5, 99.0)
 
 def _theil_sen_mk(years, values):
@@ -1096,10 +1097,8 @@ def _regime_trend_figure(data, seasons, ylabel, suptitle, outstem, k, label):
             vals = d[c]['series'].values
             ok = np.isfinite(vals)
             ax.plot(years, vals, color=color, linewidth=1.0, alpha=0.20, zorder=2)
-            smooth = np.full_like(vals, np.nan, dtype=float)
-            if ok.sum() >= ROLLING_REGIME:
-                smooth[ok] = pd.Series(vals[ok]).rolling(
-                    ROLLING_REGIME, center=True, min_periods=1).mean().values
+            smooth = pd.Series(vals, index=years).rolling(
+                ROLLING_REGIME, center=True, min_periods=2).mean().values
             ax.plot(years, smooth, color=color, linewidth=1.0, alpha=0.85,
                     zorder=3)
             if np.isfinite(d[c]['slope']) and np.isfinite(d[c]['intercept']):
@@ -1150,11 +1149,11 @@ def supp_persistence(season, k, var_tag):
 
     _regime_trend_figure(dur, seasons, 'Mean streak\nduration (days)',
                          'Circulation Regime Persistence, 1940\u20132024\n'
-                         'Mean streak duration | 5-year rolling mean',
+                         'Mean streak duration | 10-year rolling mean',
                          f'{FIGURES}/FigSx_regime_persistence', k, 'persistence')
     _regime_trend_figure(freq, seasons, 'Frequency\n(% of days)',
                          'Circulation Regime Frequency, 1940\u20132024\n'
-                         'Percent of season-days | 5-year rolling mean',
+                         'Percent of season-days | 10-year rolling mean',
                          f'{FIGURES}/FigSx_regime_frequency', k, 'frequency')
 
     rows = []
@@ -1239,11 +1238,11 @@ def _type_by_cluster_grid(data, sig, wet_masked, k, col_labels, title,
             flag = (' *' if domain_sig is not None
                     and domain_sig[c].get(name, False) else '')
             if j == 0:
-                ax.set_title(col_labels[c], fontsize=9.5, fontweight='bold',
+                ax.set_title(col_labels[c], fontsize=11, fontweight='bold',
                              pad=6)
             if c == 0:
                 ax.text(-0.14, 0.5, TYPE_LABELS[name], transform=ax.transAxes,
-                        fontsize=11, fontweight='bold', rotation=90,
+                        fontsize=12, fontweight='bold', rotation=90,
                         va='center', ha='center')
             panel_label(ax, f'({LETTERS[panel]}){flag}')
             panel += 1
@@ -1253,9 +1252,9 @@ def _type_by_cluster_grid(data, sig, wet_masked, k, col_labels, title,
     for cs, pos in ((cs_wet, 0.53), (cs_dry, 0.07)):
         cax = fig.add_axes([0.92, pos, 0.014, 0.36])
         cb = fig.colorbar(cs, cax=cax, extend='both')
-        cb.set_label(cbar_label, fontsize=9)
-        cb.ax.tick_params(labelsize=8)
-    fig.suptitle(title, fontsize=12, fontweight='bold', y=0.985)
+        cb.set_label(cbar_label, fontsize=11)
+        cb.ax.tick_params(labelsize=10)
+    fig.suptitle(title, fontsize=13, fontweight='bold', y=0.985)
     save_fig(fig, outstem)
 
 def supp_anomaly_grid(season, k, var_tag):
@@ -1310,15 +1309,15 @@ def supp_diff_grid(season, k, var_tag, thresh=None):
                       f'{int(row["n_days_later"])})')
 
     label = ('fixed 1991-2020 thresholds' if thresh == 'fixed'
-             else 'period-specific (own climatology) thresholds')
+             else 'period-specific thresholds')
     _type_by_cluster_grid(
         diffs, sig, wet_masked, k, labels,
         f'{season.title()} compound-extreme frequency change by circulation '
         f'regime\n{LATER_YEARS[0]}\u2013{LATER_YEARS[1]} minus '
-        f'{EARLY_YEARS[0]}\u2013{EARLY_YEARS[1]}, {label}\n'
-        '* = domain-mean change also significant',
+        f'{EARLY_YEARS[0]}\u2013{EARLY_YEARS[1]}, {label}\n',
+        #'* = domain-mean change also significant',
         f'{FIGURES}/{season}_figS_diff_grid_{thresh}',
-        3.0, 6.0, 'Frequency change (% points)', domain_sig=dsig)
+        3.0, 6.0, 'Frequency change (%)', domain_sig=dsig)
 
 def supp_change_ownclim(season, k, var_tag):
     figure3(season, k, var_tag, thresh='ownclim')
@@ -1404,10 +1403,9 @@ def supp_trends(season, k, var_tag):
             ax.plot(yy, v, 'o-', lw=1.6, ms=4, alpha=0.7, color='0.25')
 
             sig = np.isfinite(t['p']) and t['p'] < ALPHA
-            if sig:
-                ax.plot(yy, t['slope'] * yy + icept, 'r--', lw=2,
-                        label=(f'Linear: {t["slope"]:+.4f} {cfg["unit"]}, '
-                               f'{_fmt_p(t["p"])}' if is_t else 'Sen slope'))
+            ax.plot(yy, t['slope'] * yy + icept, 'r--', lw=2,
+                    label=(f'Linear: {t["slope"]:+.4f} {cfg["unit"]}, '
+                           f'{_fmt_p(t["p"])}') if (is_t and sig) else 'Linear')
 
             r2q = np.nan
             if is_t:
@@ -1416,13 +1414,14 @@ def supp_trends(season, k, var_tag):
                 r2q = 1 - ((v - quad) ** 2).sum() / ((v - v.mean()) ** 2).sum()
                 ax.plot(yy, quad, 'b-', lw=2, label=f'Quadratic (R\u00b2={r2q:.3f})')
                 ax.legend(fontsize=8, loc='upper left')
-            elif sig:
+            else:
                 ax.legend(fontsize=8, loc='upper right')
-                ax.text(0.03, 0.97, f'{t["slope"]:+.4f} {cfg["unit"]}\n'
-                                    f'{_fmt_p(t["p"])}',
-                        transform=ax.transAxes, va='top', ha='left', fontsize=8,
-                        bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
-                                  edgecolor='0.4', alpha=0.9))
+                if sig:
+                    ax.text(0.03, 0.97, f'{t["slope"]:+.4f} {cfg["unit"]}\n'
+                                        f'{_fmt_p(t["p"])}',
+                            transform=ax.transAxes, va='top', ha='left', fontsize=8,
+                            bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                                      edgecolor='0.4', alpha=0.9))
 
             ax.set_title(label, fontsize=11)
             if c == 0:
