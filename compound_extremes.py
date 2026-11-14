@@ -35,27 +35,39 @@ FILE_TYPE = {'wet-warm': 'warm_wet', 'wet-cold': 'cold_wet',
 
 ALPHA = 0.10               # Mann-Whitney tests run at the 10% level
 MIN_DAYS_PER_YEAR = 5      # cluster days for a season-year to contribute
-MIN_YEARS = 10             # annual values needed in each sample
+MIN_YEARS = 20             # annual values needed in each sample
 MIN_NONZERO_YEARS = 5      # non-zero years needed across both samples
-MIN_DOMAIN_YEARS = 5       # years needed for a domain-mean test
+MIN_DOMAIN_YEARS = 20       # years needed for a domain-mean test
+MIN_EVENT_DAYS = 0        # event-day gate off; sample size set by MIN_YEARS
 
 SERIES_EXCLUDE_WET_MASK = True
 
+MIN_DAYS_PER_SEASON = 80   # a complete season, as in z500_regimes.py
+
+def season_year(dates, season):
+    """Season-year of each date; winter Decembers belong to the following year."""
+    dates = pd.DatetimeIndex(dates)
+    y = np.asarray(dates.year, dtype=int)
+    if season == 'winter':
+        y = np.where(np.asarray(dates.month) == 12, y + 1, y)
+    return y
+
 def annual_freq(mask_da, cluster_arr, cluster, min_days=MIN_DAYS_PER_YEAR,
-                years_range=None, with_other=False):
+                years_range=None, with_other=False, season=None):
     dates = pd.to_datetime(mask_da.valid_time.values)
+    years_of = season_year(dates, season)
     in_c = np.asarray(cluster_arr == cluster)
     in_o = np.asarray(cluster_arr >= 0) & ~in_c      # unassigned days excluded
     vals = mask_da.values
 
-    years_all = np.unique(dates.year)
+    years_all = np.unique(years_of)
     if years_range is not None:
         years_all = years_all[(years_all >= years_range[0])
                               & (years_all <= years_range[1])]
 
     fc, fo, years = [], [], []
     for yr in years_all:
-        yr_sel = dates.year == yr
+        yr_sel = years_of == yr
         sel_c = in_c & yr_sel
         n_c = int(sel_c.sum())
         if n_c < min_days:
@@ -77,7 +89,7 @@ def annual_freq(mask_da, cluster_arr, cluster, min_days=MIN_DAYS_PER_YEAR,
 
 
 def mw_cells(cube_a, cube_b, domain, alpha=ALPHA, min_years=MIN_YEARS,
-             min_nonzero=MIN_NONZERO_YEARS):
+             min_nonzero=MIN_NONZERO_YEARS, nonzero_sample='both', enough=None):
     nlat, nlon = domain.shape
     pvals = np.full((nlat, nlon), np.nan)
     effect = np.full((nlat, nlon), np.nan)
@@ -89,8 +101,14 @@ def mw_cells(cube_a, cube_b, domain, alpha=ALPHA, min_years=MIN_YEARS,
     if cube_a.shape[0] < min_years or cube_b.shape[0] < min_years:
         return sig, none, pvals, effect
 
-    nonzero = (cube_a > 0).sum(axis=0) + (cube_b > 0).sum(axis=0)
+    if nonzero_sample == 'b':      
+        nonzero = (cube_b > 0).sum(axis=0)
+    else:
+        nonzero = (cube_a > 0).sum(axis=0) + (cube_b > 0).sum(axis=0)
     testable = domain & (nonzero >= min_nonzero)
+    
+    if enough is not None:
+        testable &= enough
 
     if testable.any():
         a, b = cube_a[:, testable], cube_b[:, testable]
@@ -227,9 +245,8 @@ class CompoundExtremes:
                 'dry-warm': is_dry & w, 'dry-cold': is_dry & c}
 
     def identify_extremes(self):
-        dates = pd.to_datetime(self.temp_anom.valid_time.values)
-        ref = ((dates.year >= REFERENCE_PERIOD[0])
-               & (dates.year <= REFERENCE_PERIOD[1]))
+        sy = season_year(self.temp_anom.valid_time.values, self.season)
+        ref = (sy >= REFERENCE_PERIOD[0]) & (sy <= REFERENCE_PERIOD[1])
         print(f'  reference period: {int(ref.sum()):,} days')
         warm, cold, wet, dry, wet_masked = self._thresholds(
             self.temp_anom.isel(valid_time=ref))
@@ -245,8 +262,8 @@ class CompoundExtremes:
 
     def period_masks(self, period_years, period_label):
         """Extremes defined from one period's own thresholds."""
-        dates = pd.to_datetime(self.temp_anom.valid_time.values)
-        sel = ((dates.year >= period_years[0]) & (dates.year <= period_years[1]))
+        sy = season_year(self.temp_anom.valid_time.values, self.season)
+        sel = (sy >= period_years[0]) & (sy <= period_years[1])
         temp_p = self.temp_anom.isel(valid_time=sel)
         warm, cold, wet, dry, wet_masked = self._thresholds(temp_p, period_label)
         masks = self._combine(temp_p, self.precip.isel(valid_time=sel),
@@ -268,9 +285,8 @@ class CompoundExtremes:
 
     def calculate_frequencies(self):
         n_all = len(self.temp_anom.valid_time)
-        dates = pd.to_datetime(self.temp_anom.valid_time.values)
-        ref = ((dates.year >= REFERENCE_PERIOD[0])
-               & (dates.year <= REFERENCE_PERIOD[1]))
+        sy = season_year(self.temp_anom.valid_time.values, self.season)
+        ref = (sy >= REFERENCE_PERIOD[0]) & (sy <= REFERENCE_PERIOD[1])
         ref_idx = np.flatnonzero(ref)
 
         self.clim_freq, self.ref_freq = {}, {}
@@ -325,11 +341,54 @@ class CompoundExtremes:
                                                'longitude')
                 cube_c, cube_o, years = annual_freq(
                     m, self.cluster_arr, c, MIN_DAYS_PER_YEAR,
-                    REFERENCE_PERIOD, with_other=True)
+                    REFERENCE_PERIOD, with_other=True, season=self.season)
                 # (rest, cluster) so positive effect means cluster exceeds rest
                 sig, tested, _, eff = mw_cells(cube_o, cube_c, self.land_mask,
                                                alpha=alpha)
                 sig_all[c][name], self.effect_maps[c][name] = sig, eff
+                n_s += int(sig.sum())
+                n_t += int(tested.sum())
+            print(f'    cluster {c}: {len(years)} years, {n_s:,} significant '
+                  f'of {n_t:,} tested (4 types)')
+        return sig_all
+    
+    def get_clim_significance(self, alpha=ALPHA):
+        if getattr(self, 'clim_significance', None) is None:
+            self.clim_significance = self._clim_significance(alpha)
+        return self.clim_significance
+
+    def _clim_significance(self, alpha=ALPHA):
+        sig_all, self.clim_effect_maps = {}, {}
+        all_days = np.zeros(len(self.cluster_arr), dtype=int)
+        print(f'\n  per-cell Mann-Whitney, cluster vs all '
+              f'{REFERENCE_PERIOD[0]}-{REFERENCE_PERIOD[1]} days:')
+
+        masks, cube_all = {}, {}
+        for name in TYPES:
+            masks[name] = self.masks[name].transpose('valid_time', 'latitude',
+                                                     'longitude')
+            cube_all[name], _ = annual_freq(masks[name], all_days, 0,
+                                            MIN_DAYS_PER_YEAR, REFERENCE_PERIOD,
+                                            season=self.season)
+
+        sy = season_year(self.temp_anom.valid_time.values, self.season)   
+        ref = (sy >= REFERENCE_PERIOD[0]) & (sy <= REFERENCE_PERIOD[1])  
+
+        for c in range(self.num_clusters):
+            idx = np.flatnonzero(ref & (self.cluster_arr == c))          
+            sig_all[c], self.clim_effect_maps[c] = {}, {}
+            n_s = n_t = 0
+            for name in TYPES:
+                cube_c, years = annual_freq(masks[name], self.cluster_arr, c,
+                                            MIN_DAYS_PER_YEAR, REFERENCE_PERIOD,
+                                            season=self.season)
+                # (all days, cluster) so positive effect means cluster exceeds the climatology
+                n_ev = masks[name].isel(valid_time=idx).sum('valid_time').values
+                sig, tested, _, eff = mw_cells(cube_all[name], cube_c,
+                                               self.land_mask, alpha=alpha,
+                                               #nonzero_sample='b',
+                                               enough=n_ev >= MIN_EVENT_DAYS)
+                sig_all[c][name], self.clim_effect_maps[c][name] = sig, eff
                 n_s += int(sig.sum())
                 n_t += int(tested.sum())
             print(f'    cluster {c}: {len(years)} years, {n_s:,} significant '
@@ -365,6 +424,7 @@ class CompoundExtremes:
         os.makedirs(OUT_CSV, exist_ok=True)
         tag = f'{self.var}_raw' if self.raw else self.var
         sig = self.get_significance()
+        csig = self.get_clim_significance()
 
         for name, short in FILE_TYPE.items():
             self.clim_freq[name].to_netcdf(
@@ -376,6 +436,8 @@ class CompoundExtremes:
                 self.cluster_freq[c][name].to_netcdf(f'{stem}_frequencies.nc')
                 self.noncluster_freq[c][name].to_netcdf(
                     f'{stem}_noncluster_frequencies.nc')
+                self.ref_cluster_freq[c][name].to_netcdf(
+                    f'{stem}_reference_frequencies.nc')
                 self.ref_anomaly[c][name].to_netcdf(f'{stem}_anomaly.nc')
                 xr.DataArray(sig[c][name], coords=self.land_da.coords,
                              dims=self.land_da.dims).to_netcdf(
@@ -386,6 +448,15 @@ class CompoundExtremes:
                 ).assign_attrs(description=(
                     'rank-biserial; positive = cluster exceeds the rest of the '
                     'reference period')).to_netcdf(f'{stem}_effect.nc')
+                xr.DataArray(csig[c][name], coords=self.land_da.coords,
+                             dims=self.land_da.dims).to_netcdf(
+                                 f'{stem}_clim_significance.nc')
+                xr.DataArray(
+                    self.clim_effect_maps[c][name], coords=self.land_da.coords,
+                    dims=self.land_da.dims
+                ).assign_attrs(description=(
+                    'rank-biserial; positive = cluster exceeds all days of the '
+                    'reference period')).to_netcdf(f'{stem}_clim_effect.nc')
         print(f'  wrote frequency, anomaly, significance and effect fields to '
               f'{OUT_NC}')
 
@@ -421,14 +492,17 @@ def stage_series(a, areas, tag):
         mask = a.masks[name].transpose('valid_time', 'latitude', 'longitude')
         dom = (valid_domain(land, a.wet_masked & land, name)
                if SERIES_EXCLUDE_WET_MASK else land)
-        cube, years = annual_freq(mask, zeros, 0, MIN_DAYS_PER_YEAR)
+        cube, years = annual_freq(mask, zeros, 0, MIN_DAYS_PER_SEASON,
+                                     season=a.season)
         freq = domain_mean_series(cube, dom, weights)
-        ext = annual_max_extent(mask, zeros, 0, dom, areas)
+        ext = annual_max_extent(mask, zeros, 0, dom, areas,
+                                   min_days=MIN_DAYS_PER_SEASON, season=a.season)
 
         daily = (mask.values[:, dom].astype(np.float32) * areas[dom]).sum(axis=1)
+        sy = season_year(dates, a.season)
         ext_date = {}
         for y in years:
-            idx = np.flatnonzero(dates.year == y)
+            idx = np.flatnonzero(sy == y)
             ext_date[y] = dates[idx[np.argmax(daily[idx])]].strftime('%Y-%m-%d')
 
         if not (len(years) == len(freq) == len(ext)):
@@ -498,15 +572,16 @@ def stage_events(a, areas, tag, n_events=10, year_min=2000):
     print(f'  wrote {fp}')
 
 def annual_max_extent(mask_da, cluster_arr, cluster, domain, areas,
-                      min_days=MIN_DAYS_PER_YEAR):
+                      min_days=MIN_DAYS_PER_YEAR, season=None):
     dates = pd.to_datetime(mask_da.valid_time.values)
+    years_of = season_year(dates, season)
     in_c = np.asarray(cluster_arr == cluster)
     vals = mask_da.values
     areas_dom = areas[domain]
 
     out = []
-    for yr in np.unique(dates.year):
-        sel = in_c & (dates.year == yr)
+    for yr in np.unique(years_of):
+        sel = in_c & (years_of == yr)
         if int(sel.sum()) < min_days:
             continue
         daily = (vals[sel][:, domain].astype(float) * areas_dom).sum(axis=1)
@@ -520,11 +595,9 @@ def build_masks(a, use_fixed):
     land = a.land_mask
     if use_fixed:
         a.identify_extremes()
-        dates = pd.to_datetime(a.temp_anom.valid_time.values)
-        sel_e = np.asarray((dates.year >= EARLY_YEARS[0])
-                           & (dates.year <= EARLY_YEARS[1]))
-        sel_l = np.asarray((dates.year >= LATER_YEARS[0])
-                           & (dates.year <= LATER_YEARS[1]))
+        sy = season_year(a.temp_anom.valid_time.values, a.season)
+        sel_e = (sy >= EARLY_YEARS[0]) & (sy <= EARLY_YEARS[1])
+        sel_l = (sy >= LATER_YEARS[0]) & (sy <= LATER_YEARS[1])
         me = {n: a.masks[n].isel(valid_time=sel_e) for n in TYPES}
         ml = {n: a.masks[n].isel(valid_time=sel_l) for n in TYPES}
         excl = a.wet_masked & land
@@ -594,10 +667,14 @@ def compute_all(a, num_clusters, me, ce, ml, cl, excl_test, excl_e, excl_l,
             dom_e = valid_domain(land, excl_e, name)
             dom_l = valid_domain(land, excl_l, name)
 
-            cube_e, yrs_e = annual_freq(mask_e, ce_c, cid, MIN_DAYS_PER_YEAR)
-            cube_l, yrs_l = annual_freq(mask_l, cl_c, cid, MIN_DAYS_PER_YEAR)
+            cube_e, yrs_e = annual_freq(mask_e, ce_c, cid, MIN_DAYS_PER_YEAR,
+                                        season=a.season)
+            cube_l, yrs_l = annual_freq(mask_l, cl_c, cid, MIN_DAYS_PER_YEAR,
+                                        season=a.season)
 
-            sig, tested, pvals, effect = mw_cells(cube_e, cube_l, dom_test)
+            enough = (k_e + k_l) >= MIN_EVENT_DAYS          # across both periods
+            sig, tested, pvals, effect = mw_cells(cube_e, cube_l, dom_test,
+                                                  enough=enough)
 
             results[c][name] = dict(
                 diff=np.where(dom_test, f_l - f_e, np.nan),
@@ -605,8 +682,8 @@ def compute_all(a, num_clusters, me, ce, ml, cl, excl_test, excl_e, excl_l,
                 effect_map=effect, n_e=n_e, n_l=n_l,
                 annual_early=domain_mean_series(cube_e, dom_e, weights),
                 annual_later=domain_mean_series(cube_l, dom_l, weights),
-                extent_early=annual_max_extent(mask_e, ce_c, cid, dom_e, areas),
-                extent_later=annual_max_extent(mask_l, cl_c, cid, dom_l, areas),
+                extent_early=annual_max_extent(mask_e, ce_c, cid, dom_e, areas, season=a.season),
+                extent_later=annual_max_extent(mask_l, cl_c, cid, dom_l, areas, season=a.season),
                 n_cube_yrs_e=len(yrs_e), n_cube_yrs_l=len(yrs_l))
 
             n_dom, n_t = int(dom_test.sum()), int(tested.sum())
