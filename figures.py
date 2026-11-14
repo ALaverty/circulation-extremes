@@ -1,4 +1,3 @@
-
 # This script plots all figures for the compound-extremes analysis, main text and supplementary.
 # Temperature follows the convention per figure: detrended for the regime characterization, the climatology row of figure 1,
 # and the supplementary anomaly grid; raw everywhere else. --raw or --detr overrides it throughout.
@@ -20,7 +19,6 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
-from matplotlib.lines import Line2D
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cartopy.io.shapereader as shpreader
@@ -54,7 +52,7 @@ TYPE_COLORS_DARK = {'wet-cold': '#154360', 'wet-warm': '#7B241C',
                     'dry-warm': '#9C640C', 'dry-cold': '#1F618D'}
 CLUSTER_COLORS = ['#3AA88B', '#F08A64', '#5B7FC4',
                   '#9BBF3F', '#F5CE3E', '#D9B48F']
-COLOR_EARLY, COLOR_LATER = '#4A2C6E', '#F5C242'
+COLOR_EARLY, COLOR_LATER = '#8C939D', '#287D78'
 GRAY = np.array([0.90, 0.90, 0.90])
 
 LETTERS = 'abcdefghijklmnopqrstuvwxyz'
@@ -182,15 +180,15 @@ def setup_map(ax, labels=True, left=True, bottom=True, white_bg=True):
         gl.xlines = gl.ylines = False
         gl.top_labels = gl.right_labels = False
         gl.left_labels, gl.bottom_labels = left, bottom
-        gl.xlabel_style = gl.ylabel_style = {'size': 8}
+        gl.xlabel_style = gl.ylabel_style = {'size': 10}
         return gl
 
-def stipple(ax, lon_plot, lat_mesh, sig, density=3, size=1.0, color='black'):
+def stipple(ax, lon_plot, lat_mesh, sig, density=2, size=1.5, color='black', edge=None):
     s = sig[::density, ::density]
     if s.any():
         ax.scatter(lon_plot[::density, ::density][s],
                    lat_mesh[::density, ::density][s], color=color, s=size,
-                   alpha=0.6, marker='.', transform=ccrs.PlateCarree(),
+                   alpha=1.0, marker='o', edgecolors=edge if edge else 'none', linewidths=0.2 if edge else 0, transform=ccrs.PlateCarree(),
                    zorder=7)
 
 def mark_masked(ax, lon_plot, lat_mesh, mask, size=2.5):
@@ -199,10 +197,10 @@ def mark_masked(ax, lon_plot, lat_mesh, mask, size=2.5):
                    alpha=0.85, marker='s', transform=ccrs.PlateCarree(),
                    zorder=3)
 
-def panel_label(ax, text, boxed=True):
+def panel_label(ax, text, boxed=True, fontsize=11):
     kw = dict(bbox=dict(boxstyle='square,pad=0.15', facecolor='white',
                         edgecolor='none', alpha=0.8)) if boxed else {}
-    ax.text(0.02, 0.97, text, transform=ax.transAxes, fontsize=11,
+    ax.text(0.02, 0.97, text, transform=ax.transAxes, fontsize=fontsize,
             fontweight='bold', va='top', ha='left', zorder=10, **kw)
 
 def freq_cmap(vmax=10.0, wet=True):
@@ -233,7 +231,7 @@ def save_fig(fig, outpath, formats=('png',)):
     plt.close(fig)
     print(f'  Saved: {outpath}.' + '/.'.join(formats))
 
-def mw_test(early, later, min_n=5):
+def mw_test(early, later, min_n=20):
     e = np.asarray(early, float)
     l = np.asarray(later, float)
     e, l = e[np.isfinite(e)], l[np.isfinite(l)]
@@ -245,15 +243,16 @@ def mw_test(early, later, min_n=5):
     except Exception:
         return np.nan, np.nan
 
-def annual_composites(z500, cluster, year_range, min_days=5):
+def annual_composites(z500, cluster, year_range, min_days=5, season=None):
     dates = pd.to_datetime(z500.valid_time.values)
+    yrs_of = _season_year(dates, season)
     cmask = (z500.cluster == cluster).values
     vals = z500.values
     nlat, nlon = len(z500.latitude), len(z500.longitude)
 
     comps, years, n_days = [], [], []
     for yr in range(year_range[0], year_range[1] + 1):
-        sel = cmask & (dates.year == yr)
+        sel = cmask & (yrs_of == yr)
         n = int(sel.sum())
         if n < min_days:
             continue
@@ -271,9 +270,11 @@ def extent_mask(lats, lons_plot, extent=EXTENT):
             & (lat_mesh >= lat_min) & (lat_mesh <= lat_max))
 
 def compare_periods(z500, cluster, min_days=5, alpha=ALPHA, cell_mask=None,
-                    do_cell_map=True):
-    comps_e, yrs_e, nd_e = annual_composites(z500, cluster, EARLY_YEARS, min_days)
-    comps_l, yrs_l, nd_l = annual_composites(z500, cluster, LATER_YEARS, min_days)
+                    do_cell_map=True, season=None):
+    comps_e, yrs_e, nd_e = annual_composites(z500, cluster, EARLY_YEARS,
+                                             min_days, season=season)
+    comps_l, yrs_l, nd_l = annual_composites(z500, cluster, LATER_YEARS,
+                                             min_days, season=season)
 
     lats = z500.latitude.values
     nlat, nlon = len(lats), len(z500.longitude)
@@ -291,11 +292,20 @@ def compare_periods(z500, cluster, min_days=5, alpha=ALPHA, cell_mask=None,
     amp_l = np.array([amplitude(c) for c in comps_l])
     amp_p, amp_r = mw_test(amp_e, amp_l)
 
-    comp_e = comps_e.mean(axis=0) if len(comps_e) else np.full((nlat, nlon), np.nan)
-    comp_l = comps_l.mean(axis=0) if len(comps_l) else np.full((nlat, nlon), np.nan)
+    dates = pd.to_datetime(z500.valid_time.values)
+    yrs_of = _season_year(dates, season)
+    cmask = (z500.cluster == cluster).values
+    vals = z500.values
+
+    def pooled(years):
+        sel = cmask & (yrs_of >= years[0]) & (yrs_of <= years[1])
+        return (np.nanmean(vals[sel], axis=0) if sel.any()
+                else np.full((nlat, nlon), np.nan))
+
+    comp_e, comp_l = pooled(EARLY_YEARS), pooled(LATER_YEARS)
 
     pvals = np.full((nlat, nlon), np.nan)
-    if do_cell_map and len(comps_e) >= 3 and len(comps_l) >= 3:
+    if do_cell_map and len(comps_e) >= 20 and len(comps_l) >= 20:
         for i in range(nlat):
             for j in range(nlon):
                 if cell_mask is not None and not cell_mask[i, j]:
@@ -339,12 +349,13 @@ MAP_VMAX = {'fixed': dict(wet=1.0, dry=4.0),
             'ownclim': dict(wet=1.0, dry=4.0)}
 
 EVENTS = {'wet-cold': '2010-02-03', 'wet-warm': '2011-12-05',
-          'dry-warm': '2012-01-04', 'dry-cold': '2022-12-19'}
+          'dry-warm': '1986-02-27', 'dry-cold': '1989-02-07'}
 
 FIG1_WET_VMAX, FIG1_DRY_VMAX = 4.0, 10.0     
-FREQ_YMAX = {'wet': 2.5, 'dry': 9.0}          
-EXT_YMAX = {'wet': 2.0, 'dry': 5.0}           
+FREQ_YMAX = {'wet': 2.6, 'dry': 9.0}          
+EXT_YMAX = {'wet': 2.6, 'dry': 9.0}           
 ROLLING = 10
+FIG1_VMAX = 10.0
 
 FREQ_YLIM = {'wet-cold': (0, 5.0), 'wet-warm': (0, 5.0),
              'dry-warm': (0, 16.0), 'dry-cold': (0, 16.0)}
@@ -354,10 +365,10 @@ EXT_YLIM = {'wet-cold': (0, 1600), 'wet-warm': (0, 1600),
 Z_TEMP_VMAX, Z_PRECIP_VMAX = 1.5, 100
 
 FIG1_LAYOUT = dict(size=(19, 18.5),
-                   heights=(1.75, 0.035, 0.09, 1.65), 
+                   heights=(1.55, 0.035, 0.09, 1.65), 
                    outer_hspace=0.05,
-                   map_hspace=0.04,                   
-                   series_hspace=0.40)               
+                   map_hspace=0.01,                   
+                   series_hspace=0.14)               
 FIG3_LAYOUT = dict(size=(18, 13),
                    heights=(1.0, 0.07, 0.14, 1.85), 
                    outer_hspace=0.14,
@@ -382,14 +393,18 @@ def series_panel(ax, years, vals, color, ylabel, ymax, step, label,
             label=f'{ROLLING}-yr rolling mean', zorder=5)
 
     slope, intercept, p = trend(years, vals)
-    ax.plot(years, slope * years + intercept, color='black', linewidth=2.0,
+    sig = np.isfinite(p) and p < ALPHA
+    if sig:
+        ax.plot(years, slope * years + intercept, color='black', linewidth=2.0,
             linestyle='--', alpha=0.7, zorder=4)
-    ax.text(0.97, 0.97, f'{slope * 10:+.2f}/dec, p={p:.2f}',
+    p_txt = 'p<0.01' if p < 0.01 else f'p={p:.2f}'
+    ax.text(0.97, 0.97, f'{slope * 10:+.2f}/dec, {p_txt}',
             transform=ax.transAxes, fontsize=12, va='top', ha='right',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9,
                       edgecolor='none'))
 
-    ax.set_title(f'{label})', fontsize=15, fontweight='bold', loc='left')
+    #ax.set_title(f'{label})', fontsize=15, fontweight='bold', loc='left')
+    panel_label(ax, f'{label})', boxed=False, fontsize=15)
     if ylabel:
         ax.set_ylabel(ylabel, fontsize=13, fontweight='bold')
     ax.set_xlim(1940, 2025)
@@ -400,10 +415,10 @@ def series_panel(ax, years, vals, color, ylabel, ymax, step, label,
     ax.tick_params(axis='both', labelsize=11)
     ax.spines[['top', 'right']].set_visible(False)
     if legend:
-        ax.legend(fontsize=11, loc='upper left', framealpha=0.9)
+        ax.legend(fontsize=11, loc='upper right', bbox_to_anchor=(0.98, 0.92), framealpha=0.9)
 
 def figure1(season, k, var_tag):
-    from compound_extremes import CompoundExtremes
+    from compound_extremes_edit import CompoundExtremes
 
     a = CompoundExtremes(season, k, BASE, var=var_tag.split('_')[0],
                          raw=var_tag.endswith('raw'))
@@ -426,8 +441,8 @@ def figure1(season, k, var_tag):
                              hspace=L['outer_hspace'], top=0.95, bottom=0.05,
                              left=0.05, right=0.98)
     g_map = outer[0].subgridspec(2, 4, hspace=L['map_hspace'], wspace=0.06)
-    g_cb = outer[1].subgridspec(1, 2, wspace=0.15)
-    g_ts = outer[3].subgridspec(2, 4, hspace=L['series_hspace'], wspace=0.18)
+    g_cb = outer[1].subgridspec(1, 8, wspace=0.15)
+    g_ts = outer[3].subgridspec(2, 4, hspace=L['series_hspace'], wspace=0.12)
     axes = np.empty((4, 4), dtype=object)
     for r in range(2):
         for c in range(4):
@@ -444,7 +459,7 @@ def figure1(season, k, var_tag):
         if date != target:
             print(f'    note: nearest day to {target.date()} is {date.date()}')
 
-        setup_map(ax, labels=False, white_bg=False)
+        setup_map(ax, labels=(j == 0), bottom=False, white_bg=False)
         ax.add_feature(cfeature.LAND, facecolor='#f5f5f0', zorder=0)
         day = a.masks[name].isel(valid_time=idx).values
         ax.pcolormesh(lon_plot, lat_mesh,
@@ -460,19 +475,21 @@ def figure1(season, k, var_tag):
                         levels=np.linspace(-vmax, vmax, 11), colors='black',
                         linewidths=1.0, transform=ccrs.PlateCarree(), zorder=3)
         ax.clabel(cs, inline=True, fontsize=7, fmt='%.0f')
-        ax.set_title(f'{LETTERS[j]}) {TYPE_LABELS[name]}:\n'
+        ax.set_title(f'{LETTERS[j]}) {TYPE_LABELS[name]}: '
                      f'{date:%B} {date.day}, {date.year}',
-                     fontsize=12, fontweight='bold', loc='left')
+                     fontsize=15, fontweight='bold', loc='left')
 
     # row 2: 1991-2020 climatological frequency
-    wet_cmap, wet_norm, wet_b = freq_cmap(FIG1_WET_VMAX, wet=True)
-    dry_cmap, dry_norm, dry_b = freq_cmap(FIG1_DRY_VMAX, wet=False)
-    cs_wet = cs_dry = None
+    #wet_cmap, wet_norm, wet_b = freq_cmap(FIG1_WET_VMAX, wet=True)
+    #dry_cmap, dry_norm, dry_b = freq_cmap(FIG1_DRY_VMAX, wet=False)
+    #cs_wet = cs_dry = None
+    cmap, norm, bounds = freq_cmap(FIG1_VMAX, wet=False)
+    cs_clim = None
     for j, name in enumerate(TYPES):
         ax = axes[1, j]
         is_wet = name in WET_TYPES
-        cmap, norm, bounds = ((wet_cmap, wet_norm, wet_b) if is_wet
-                              else (dry_cmap, dry_norm, dry_b))
+        #cmap, norm, bounds = ((wet_cmap, wet_norm, wet_b) if is_wet
+        #                      else (dry_cmap, dry_norm, dry_b))
         setup_map(ax, labels=True, left=(j == 0), bottom=(j == 0))
         data = load_field(season, name, clim_tag, kind='reference_frequencies')
         if is_wet:
@@ -482,12 +499,14 @@ def figure1(season, k, var_tag):
         cs = ax.contourf(lon_plot, lat_mesh, data, levels=bounds, cmap=cmap,
                          norm=norm, extend='max',
                          transform=ccrs.PlateCarree(), zorder=2)
-        if is_wet:
-            cs_wet = cs
-        else:
-            cs_dry = cs
-        ax.set_title(f'{LETTERS[4 + j]})', fontsize=13, fontweight='bold',
-                     loc='left')
+        #if is_wet:
+        #    cs_wet = cs
+        #else:
+        #    cs_dry = cs
+        cs_clim = cs
+        panel_label(ax, f'{LETTERS[4 + j]})', fontsize=15)
+        #ax.set_title(f'{LETTERS[4 + j]})', fontsize=13, fontweight='bold',
+        #             loc='left')
 
     # rows 3 and 4: full-record series
     for j, name in enumerate(TYPES):
@@ -498,26 +517,27 @@ def figure1(season, k, var_tag):
                      TYPE_COLORS[name],
                      'Frequency (% of days)' if j == 0 else '',
                      FREQ_YMAX['wet' if wet else 'dry'],
-                     0.5 if wet else 2.0, LETTERS[8 + j], legend=(j == 0))
+                     0.5 if wet else 2.5, LETTERS[8 + j], legend=(j == 0))
         series_panel(axes[3, j], yrs, sub['extent'].values / 1000.0,
                      TYPE_COLORS[name],
                      'Max Daily Extent (10$^6$ km$^2$)' if j == 0 else '',
                      EXT_YMAX['wet' if wet else 'dry'],
-                     0.5 if wet else 1.0, LETTERS[12 + j], legend=(j == 0))
+                     0.5 if wet else 2.5, LETTERS[12 + j], legend=False)
 
-    cb = fig.colorbar(cs_wet, cax=fig.add_subplot(g_cb[0]),
+    cb = fig.colorbar(cs_clim, cax=fig.add_subplot(g_cb[0, 1:7]),
                       orientation='horizontal', extend='max')
-    cb.set_ticks(wet_b)
-    cb.set_ticklabels(tick_labels(wet_b))
-    cb.set_label('Frequency (% of days)  |  Gray = masked', fontsize=11)
-    cb = fig.colorbar(cs_dry, cax=fig.add_subplot(g_cb[1]),
-                      orientation='horizontal', extend='max')
-    cb.set_ticks(dry_b)
-    cb.set_ticklabels(tick_labels(dry_b))
-    cb.set_label('Frequency (% of days)', fontsize=11)
+    cb.set_ticks(bounds)
+    cb.set_ticklabels(tick_labels(bounds))
+    cb.set_label('Frequency (% of days)  |  Gray = masked', fontsize=14)
+    cb.ax.tick_params(labelsize=12) 
+    #cb = fig.colorbar(cs_dry, cax=fig.add_subplot(g_cb[1]),
+    #                  orientation='horizontal', extend='max')
+    #cb.set_ticks(dry_b)
+    #cb.set_ticklabels(tick_labels(dry_b))
+    #cb.set_label('Frequency (% of days)', fontsize=11)
 
-    fig.suptitle(f'{season.title()}: Recent Compound Extreme Events',
-                 fontsize=14, fontweight='bold', y=0.985)
+    fig.suptitle(f'{season.title()}: Widespread Compound Events | 1991-2020 Climatology | Frequency | Extent',
+                 fontsize=15, fontweight='bold', y=0.985)
     save_fig(fig, f'{FIGURES}/{season}_fig1_events_climatology_series')
 
 def figure2(season, k, var_tag):
@@ -533,9 +553,12 @@ def figure2(season, k, var_tag):
     precip = xr.open_dataset(
         f'{BASE}/processed/precipitation_raw/precip_raw_{season}.nc')
     pvar = 'tp' if 'tp' in precip.data_vars else list(precip.data_vars)[0]
-    pclim = precip[pvar].mean('valid_time').values
+    praw = precip[pvar]
+    if not np.array_equal(praw.valid_time.values, pa.valid_time.values):
+        raise ValueError('raw and anomaly precipitation files have different days')
 
     land, land_da = land_mask_for(tz)
+    wet_masked = wet_mask_from_thresholds(season, land)
     lon_plot, lat_mesh = mesh(tz)
     clusters = load_clusters(season)
     n_total = len(clusters)
@@ -583,25 +606,30 @@ def figure2(season, k, var_tag):
 
         ax = axes[2, c]
         setup_map(ax, labels=False, white_bg=False)
-        pm = pa.isel(valid_time=(pa.cluster == c).values
-                     ).mean('valid_time').values
+        sel = (pa.cluster == c).values
+        pm = pa.isel(valid_time=sel).mean('valid_time').values
+        # climatology removed on these days (raw minus anomaly)
+        cm = np.nanmean(praw.isel(valid_time=sel).values
+                        - pa.isel(valid_time=sel).values, axis=0)
         cs_p = ax.contourf(lon_plot, lat_mesh,
-                           np.where(pclim > 0.01, pm / pclim * 100, np.nan),
+                           np.where(cm > 0.01, pm / cm * 100, np.nan),
                            levels=p_levels, cmap='BrBG', extend='both',
                            transform=ccrs.PlateCarree(), zorder=1)
         panel_label(ax, f'{LETTERS[2 * k + c]})')
 
-        # dominant enhanced type: cluster frequency minus all other days
         ax = axes[3, c]
         setup_map(ax, labels=False, white_bg=False)
         ax.add_feature(cfeature.LAND, facecolor='#f5f5f0', zorder=0)
-        anom = np.stack([
-            (load_field(season, n, var_tag, c, 'frequencies').values
-             - load_field(season, n, var_tag, c,
-                          'noncluster_frequencies').values)
+        # dominant type: most frequent within this regime
+        # (cluster-c event days / all cluster-c days, 1940-2024)
+        freq = np.stack([
+            load_field(season, n, var_tag, c, 'frequencies').values
             for n in TYPES])
-        elig = np.isfinite(anom) & (anom > 0)
-        vals = np.where(elig, anom, -np.inf)
+        for t, name in enumerate(TYPES):
+            if name in WET_TYPES:
+                freq[t][wet_masked] = np.nan
+        elig = np.isfinite(freq) & (freq > 0)
+        vals = np.where(elig, freq, -np.inf)
         best = np.argmax(vals, axis=0)
         margin = np.max(vals, axis=0) - np.sort(vals, axis=0)[-2]
         n_elig = elig.sum(axis=0)
@@ -623,7 +651,7 @@ def figure2(season, k, var_tag):
         panel_label(ax, f'{LETTERS[3 * k + c]})')
 
     for row, label in enumerate(['Z500 (m)', 'Temp (z-scores)', 'Precip (%)',
-                                 'Dominant Extremes']):
+                                 'Dominant CEs']):
         axes[row, 0].text(-0.10, 0.5, label, transform=axes[row, 0].transAxes,
                           fontsize=10, fontweight='bold', rotation=90,
                           va='center', ha='center')
@@ -684,7 +712,7 @@ def figure3(season, k, var_tag, thresh=THRESH_MAPS):
         setup_map(ax, labels=(j == 0), left=(j == 0), bottom=(j == 0))
         im = ax.pcolormesh(template.longitude, template.latitude,
                            ds[f'diff_{key}'].clip(-vmax, vmax).where(land_da),
-                           cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                           cmap='PuOr', vmin=-vmax, vmax=vmax,
                            transform=ccrs.PlateCarree(), shading='auto')
         if is_wet:
             im_wet = im
@@ -692,14 +720,14 @@ def figure3(season, k, var_tag, thresh=THRESH_MAPS):
         else:
             im_dry = im
         stipple(ax, lon_plot, lat_mesh,
-                ds[f'sig_{key}'].values.astype(bool), density=5, size=2.0)
+                ds[f'sig_{key}'].values.astype(bool), density=3, size=2.0, edge='white')
         ax.set_title(f'{LETTERS[j]}) {TYPE_LABELS[name]}', fontsize=13,
                      fontweight='bold', loc='left', pad=8)
 
     for row, (axs, metric, sig_col, ylims, ylabel, offset) in enumerate([
             (axes_f, 'frequency', 'freq_sig', FREQ_YLIM, 'Frequency (%)\n', 4),
             (axes_e, 'extent', 'ext_sig', EXT_YLIM,
-             'Max Spatial Extent (\u00d710\u00b3 km\u00b2)', 8)]):
+             'Max Extent (\u00d710\u00b3 km\u00b2)', 8)]):
         for j, name in enumerate(TYPES):
             ax = axs[j]
             early, later, flags = [], [], []
@@ -797,13 +825,14 @@ def figure4(season, k, var_tag):
                                      z500.longitude.values))
 
     print('  Z500 composites per cluster')
-    z = {c: compare_periods(z500, c, cell_mask=cell_mask) for c in range(k)}
+    z = {c: compare_periods(z500, c, cell_mask=cell_mask, season=season)
+         for c in range(k)}
     amplitude_sig(z, k)
-    
     # Day counts per cluster and period, for the column headers
     dates = pd.to_datetime(z500.valid_time.values)
-    in_e = (dates.year >= EARLY_YEARS[0]) & (dates.year <= EARLY_YEARS[1])
-    in_l = (dates.year >= LATER_YEARS[0]) & (dates.year <= LATER_YEARS[1])
+    sy = _season_year(dates, season)
+    in_e = (sy >= EARLY_YEARS[0]) & (sy <= EARLY_YEARS[1])
+    in_l = (sy >= LATER_YEARS[0]) & (sy <= LATER_YEARS[1])
     cl = z500.cluster.values
     n_days = {c: (int(((cl == c) & in_e).sum()), int(((cl == c) & in_l).sum()))
               for c in range(k)}
@@ -853,8 +882,8 @@ def figure4(season, k, var_tag):
         dom = ('positive' if d['comp_l'][d['comp_l'] > 0].sum()
                >= abs(d['comp_l'][d['comp_l'] < 0].sum()) else 'negative')
         for sign in (dom, 'negative' if dom == 'positive' else 'positive'):
-            for field, color, zo in ((d['comp_e'], '#4A2C6E', 7),
-                                     (d['comp_l'], '#F5C242', 6)):
+            for field, color, zo in ((d['comp_e'], '#8C939D', 7),
+                                     (d['comp_l'], '#287D78', 6)):
                 lo, la = peak_location(field, lon_plot, lat_mesh, sign)
                 if np.isfinite(lo):
                     ax.plot(lo, la, marker='x', color=color, markersize=9,
@@ -870,7 +899,7 @@ def figure4(season, k, var_tag):
                           cmap='coolwarm', extend='both',
                           transform=ccrs.PlateCarree(), zorder=1)
         later_contours(ax, lon_plot, lat_mesh, d['comp_l'], neg, pos)
-        stipple(ax, lon_plot, lat_mesh, d['sig'], density=3, size=0.6,
+        stipple(ax, lon_plot, lat_mesh, d['sig'], density=2, size=1.5,
                 color='#555555')
         panel_label(ax, f'{LETTERS[k + c]})')
 
@@ -961,15 +990,14 @@ def figure4(season, k, var_tag):
                         for n in TYPES],
                loc='center left', ncol=1, fontsize=9, framealpha=0.9,
                bbox_to_anchor=(0.91, 0.20))
-    fig.suptitle(f'{season.title()}: Circulation Change and Compound Extreme '
+    fig.suptitle(f'{season.title()}: Circulation Change and Compound Event '
                  f'Response', fontsize=12, fontweight='bold', y=0.99)
     save_fig(fig, f'{FIGURES}/{season}_fig4_circulation_change_response')
 
 
 # supplementary figures
 
-ALL_SEASONS = ['winter', 'spring', 'summer', 'fall']
-MIN_DAYS_PER_YEAR = 5          
+ALL_SEASONS = ['winter', 'spring', 'summer', 'fall']         
 MIN_YEARS_FOR_TREND = 10
 ROLLING_REGIME = 10
 YLIM_PCTL = (0.5, 99.0)
@@ -998,6 +1026,14 @@ def _season_year(dates, season):
         y = np.where(dates.month.values == 12, y + 1, y)
     return y
 
+MIN_DAYS_PER_SEASON = 80
+
+def _complete_season_years(season):
+    """Season-years with at least MIN_DAYS_PER_SEASON days, for any season."""
+    df = load_clusters(season)
+    counts = pd.Series(_season_year(df['date'].dt, season)).value_counts()
+    return set(counts.index[counts >= MIN_DAYS_PER_SEASON])
+
 def _regime_duration(season, k):
     fp = f'{CSV}/{season}_pattern_persistence.csv'
     if not os.path.exists(fp):
@@ -1005,6 +1041,7 @@ def _regime_duration(season, k):
     df = pd.read_csv(fp, parse_dates=['start_date', 'end_date'])
     df['plot_year'] = (df['season_year'] if season == 'winter'
                        else df['start_date'].dt.year)
+    df = df[df['plot_year'].isin(_complete_season_years(season))]
     years = np.arange(int(df['plot_year'].min()), int(df['plot_year'].max()) + 1)
 
     out = {}
@@ -1023,6 +1060,8 @@ def _regime_duration(season, k):
 def _regime_self_transition(season, k):
     df = load_clusters(season).sort_values('date').reset_index(drop=True)
     df['season_year'] = _season_year(df['date'].dt, season)
+    df = df[df['season_year'].isin(
+      _complete_season_years(season))].reset_index(drop=True)
 
     nxt_c, nxt_d = df['cluster'].shift(-1), df['date'].shift(-1)
     nxt_y = df['season_year'].shift(-1)
@@ -1055,6 +1094,7 @@ def _regime_self_transition(season, k):
 def _regime_frequency(season, k):
     df = load_clusters(season).sort_values('date').reset_index(drop=True)
     df['season_year'] = _season_year(df['date'].dt, season)
+    df = df[df['season_year'].isin(_complete_season_years(season))]
     years = np.arange(int(df['season_year'].min()), int(df['season_year'].max()) + 1)
     total = df.groupby('season_year').size().reindex(years, fill_value=0)
 
@@ -1073,63 +1113,69 @@ def _regime_frequency(season, k):
         out[c] = rec
     return years, out
 
-def _regime_trend_figure(data, seasons, ylabel, suptitle, outstem, k, label):
+def _regime_trend_figure(data, seasons, ylabel, suptitle_fmt, outstem_fmt, k,
+                         label):
     allv = np.concatenate([d[c]['series'].values[
         np.isfinite(d[c]['series'].values)] for _, d in data.values()
         for c in range(k)])
     lo, hi = np.percentile(allv, YLIM_PCTL)
     pad = 0.04 * (hi - lo)
     lo, hi = max(0.0, lo - pad), hi + pad
-    n_out = int(np.sum((allv < lo) | (allv > hi)))
-    if n_out:
-        print(f'    {label}: {n_out} of {len(allv)} annual values '
-              f'({100 * n_out / len(allv):.1f}%) fall outside the y-range '
-              'and are clipped off-scale')
 
-    fig, axes = plt.subplots(len(seasons), 1,
-                             figsize=(7.5, 2.5 * len(seasons) + 1),
-                             sharex=True, squeeze=False)
-    axes = axes.ravel()
-    for ax, season in zip(axes, seasons):
+    ncol = 1
+    nrow = k
+    for season in seasons:
         years, d = data[season]
+        fig, axes = plt.subplots(nrow, ncol, figsize=(5, 1.6 * nrow),
+                                 sharex=True, sharey=True, squeeze=False)
+        axes = axes.ravel()
+        n_sig = 0
         for c in range(k):
+            ax = axes[c]
             color = CLUSTER_COLORS[c % len(CLUSTER_COLORS)]
             vals = d[c]['series'].values
             ok = np.isfinite(vals)
-            ax.plot(years, vals, color=color, linewidth=1.0, alpha=0.20, zorder=2)
-            smooth = pd.Series(vals, index=years).rolling(
-                ROLLING_REGIME, center=True, min_periods=2).mean().values
-            ax.plot(years, smooth, color=color, linewidth=1.0, alpha=0.85,
-                    zorder=3)
-            if np.isfinite(d[c]['slope']) and np.isfinite(d[c]['intercept']):
-                sig = np.isfinite(d[c]['p']) and d[c]['p'] < ALPHA
-                ax.plot(years[ok], d[c]['slope'] * years[ok] + d[c]['intercept'],
-                        color=color, linewidth=1.0,
-                        linestyle='-' if sig else ':',
-                        alpha=0.9 if sig else 0.5, zorder=4)
-        ax.set_ylabel(f'{season.title()} {ylabel}', fontsize=10)
-        ax.set_ylim(lo, hi)
-        ax.set_xlim(years.min(), years.max())
-        ax.grid(linewidth=0.5, alpha=0.28)
-        ax.set_axisbelow(True)
-        ax.tick_params(labelsize=8.5)
-        ax.spines[['top', 'right']].set_visible(False)
-    axes[-1].set_xlabel('Season-year', fontsize=10)
+            ax.plot(years, vals, color=color, linewidth=1.0, alpha=0.85,
+                    zorder=2)
+            roll = d[c]['series'].rolling(ROLLING_REGIME, center=True,
+                              min_periods=ROLLING_REGIME // 2).mean()
+            ax.plot(years, roll.values, color=color, linewidth=2.2, zorder=3)
 
-    handles = [Line2D([], [], color=CLUSTER_COLORS[c % len(CLUSTER_COLORS)],
-                      linewidth=1.8, label=f'Cluster {c}') for c in range(k)]
-    handles += [Line2D([], [], color='0.4', linewidth=1.6, linestyle='-',
-                       label=f'Trend, p<{ALPHA}'),
-                Line2D([], [], color='0.4', linewidth=1.0, linestyle=':',
-                       label='Trend, not significant')]
-    fig.legend(handles=handles, loc='lower center', ncols=4, fontsize=10,
-               frameon=False, bbox_to_anchor=(0.5, 0.0))
-    fig.suptitle(suptitle, fontsize=11, fontweight='bold')
-    plt.tight_layout(rect=[0, 0.075, 1, 0.965])
-    save_fig(fig, outstem)
+            r = d[c]
+            sig = (np.isfinite(r['slope']) and np.isfinite(r['intercept'])
+                   and np.isfinite(r['p']) and r['p'] < ALPHA)
+            if sig:
+                n_sig += 1
+                ax.plot(years[ok], r['slope'] * years[ok] + r['intercept'],
+                        color='black', linewidth=1.8, zorder=4)
+            note = (f'{r["slope"] * 10:+.2f}/dec, p={r["p"]:.2f}' if sig
+                    else '')
+            ax.set_title(f'Cluster {c}', fontsize=10, fontweight='bold',
+                         loc='left')
+            ax.text(0.97, 0.95, note, transform=ax.transAxes, fontsize=8,
+                    va='top', ha='right', color='0.25')
+            ax.set_ylim(lo, hi)
+            ax.set_xlim(years.min(), years.max())
+            ax.grid(linewidth=0.5, alpha=0.28)
+            ax.set_axisbelow(True)
+            ax.tick_params(labelsize=8.5)
+            ax.spines[['top', 'right']].set_visible(False)
+        for ax in axes[k:]:
+            ax.set_visible(False)
+
+        fig.supylabel(ylabel, fontsize=10)
+        for i in range(max(0, k - ncol), k):
+            axes[i].set_xlabel('Season-year', fontsize=9)
+
+        print(f'    {label} / {season}: {n_sig} of {k} regimes significant '
+              f'(p<{ALPHA}, uncorrected)')
+        fig.suptitle(suptitle_fmt.format(season=season.title()), fontsize=11,
+                     fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        save_fig(fig, outstem_fmt.format(season=season))
 
 def supp_persistence(season, k, var_tag):
-    dur, self_t, freq = {}, {}, {}
+    dur, freq = {}, {}
     seasons, missing = [], []
     for s in ALL_SEASONS:
         try:
@@ -1137,7 +1183,6 @@ def supp_persistence(season, k, var_tag):
         except FileNotFoundError:
             missing.append(s)
             continue
-        self_t[s] = _regime_self_transition(s, k)
         freq[s] = _regime_frequency(s, k)
         seasons.append(s)
         print(f'    computed {s}')
@@ -1147,32 +1192,30 @@ def supp_persistence(season, k, var_tag):
         print('    no season has a persistence file; nothing to draw')
         return
 
-    _regime_trend_figure(dur, seasons, 'Mean streak\nduration (days)',
-                         'Circulation Regime Persistence, 1940\u20132024\n'
-                         'Mean streak duration | 10-year rolling mean',
-                         f'{FIGURES}/FigSx_regime_persistence', k, 'persistence')
-    _regime_trend_figure(freq, seasons, 'Frequency\n(% of days)',
-                         'Circulation Regime Frequency, 1940\u20132024\n'
-                         'Percent of season-days | 10-year rolling mean',
-                         f'{FIGURES}/FigSx_regime_frequency', k, 'frequency')
+    _regime_trend_figure(dur, seasons, 'Mean streak duration (days)',
+                         '{season} Circulation Regime Persistence, 1940\u20132024',
+                         f'{FIGURES}/FigSx_regime_persistence_{{season}}', k,
+                         'persistence')
+    _regime_trend_figure(freq, seasons, 'Frequency (% of days)',
+                         '{season} Circulation Regime Frequency, 1940\u20132024',
+                         f'{FIGURES}/FigSx_regime_frequency_{{season}}', k,
+                         'frequency')
 
     rows = []
-    for metric, data in (('self_transition', self_t), ('mean_duration', dur)):
-        for s in seasons:
-            _, d = data[s]
-            for c in range(k):
-                r = d[c]
-                rows.append(dict(
-                    metric=metric, season=s, cluster=c,
-                    pooled_estimate_days=round(r['pooled'], 3),
-                    pooled_self_transition_p=(round(r['pooled_p'], 4)
-                                              if 'pooled_p' in r else ''),
-                    sparsity=round(r['sparsity'], 1), sparsity_unit=r['unit'],
-                    n_observations=r['n_obs'], n_years_tested=r['n_years'],
-                    theil_sen_slope_per_decade=(round(r['slope'] * 10, 4)
-                                                if np.isfinite(r['slope']) else ''),
-                    mk_p_value=(round(r['p'], 4) if np.isfinite(r['p']) else ''),
-                    mk_test=r['test']))
+    for s in seasons:
+        _, d = dur[s]
+        for c in range(k):
+            r = d[c]
+            rows.append(dict(
+                season=s, cluster=c,
+                pooled_mean_duration_days=round(r['pooled'], 3),
+                sparsity=round(r['sparsity'], 1), sparsity_unit=r['unit'],
+                n_observations=r['n_obs'], n_years_tested=r['n_years'],
+                theil_sen_slope_per_decade=(round(r['slope'] * 10, 4)
+                                            if np.isfinite(r['slope']) else ''),
+                mk_p_value=(round(r['p'], 4) if np.isfinite(r['p']) else ''),
+                mk_test=r['test']))
+            
     tab = pd.DataFrame(rows)
     p = pd.to_numeric(tab['mk_p_value'], errors='coerce').values
     tab['significant'] = np.where(np.isfinite(p) & (p < ALPHA), 'yes', 'no')
@@ -1208,7 +1251,7 @@ def supp_persistence(season, k, var_tag):
 
 def _type_by_cluster_grid(data, sig, wet_masked, k, col_labels, title,
                           outstem, wet_vmax, dry_vmax, cbar_label,
-                          domain_sig=None):
+                          domain_sig=None, stipple_density=3):
     template = next(iter(data[0].values()))
     lon_plot, lat_mesh = mesh(template)
     wet_levels = np.linspace(-wet_vmax, wet_vmax, 17)
@@ -1226,14 +1269,14 @@ def _type_by_cluster_grid(data, sig, wet_masked, k, col_labels, title,
             setup_map(ax, labels=False)
             cs = ax.contourf(lon_plot, lat_mesh, data[c][name],
                              levels=wet_levels if is_wet else dry_levels,
-                             cmap='bwr', extend='both',
+                             cmap='PuOr', extend='both',
                              transform=ccrs.PlateCarree(), zorder=1)
             if is_wet:
                 cs_wet = cs
                 mark_masked(ax, lon_plot, lat_mesh, wet_masked, size=1.2)
             else:
                 cs_dry = cs
-            stipple(ax, lon_plot, lat_mesh, sig[c][name], density=3, size=0.7)
+            stipple(ax, lon_plot, lat_mesh, sig[c][name], density=stipple_density, size=4.5, edge='white')
 
             flag = (' *' if domain_sig is not None
                     and domain_sig[c].get(name, False) else '')
@@ -1258,27 +1301,30 @@ def _type_by_cluster_grid(data, sig, wet_masked, k, col_labels, title,
     save_fig(fig, outstem)
 
 def supp_anomaly_grid(season, k, var_tag):
-    anom = {c: {n: load_field(season, n, var_tag, c, 'anomaly') for n in TYPES}
-            for c in range(k)}
+    clim = {n: load_field(season, n, var_tag, kind='reference_frequencies')
+            for n in TYPES}
+    anom = {c: {n: load_field(season, n, var_tag, c, 'reference_frequencies')
+                   - clim[n]
+                for n in TYPES} for c in range(k)}
     sig = {c: {n: load_field(season, n, var_tag, c,
-                             'significance').values.astype(bool)
+                             'clim_significance').values.astype(bool)
                for n in TYPES} for c in range(k)}
     land, _ = land_mask_for(anom[0][TYPES[0]])
     wet_masked = wet_mask_from_thresholds(season, land)
 
     clusters = load_clusters(season)
-    in_ref = ((clusters['date'].dt.year >= REFERENCE_PERIOD[0])
-              & (clusters['date'].dt.year <= REFERENCE_PERIOD[1]))
+    sy = _season_year(clusters['date'].dt, season)
+    in_ref = (sy >= REFERENCE_PERIOD[0]) & (sy <= REFERENCE_PERIOD[1])
     labels = [f'Cluster {c} (n={int((in_ref & (clusters["cluster"] == c)).sum())})'
               for c in range(k)]
 
     _type_by_cluster_grid(
         anom, sig, wet_masked, k, labels,
-        f'{season.title()} compound-extreme frequency anomaly by circulation '
-        f'regime\nCluster days vs. rest of {REFERENCE_PERIOD[0]}\u2013'
-        f'{REFERENCE_PERIOD[1]} (fixed thresholds)',
+        f'{season.title()} compound-event frequency anomaly by circulation '
+        f'regime\nCluster days minus {REFERENCE_PERIOD[0]}\u2013'
+        f'{REFERENCE_PERIOD[1]} climatology (fixed thresholds)',
         f'{FIGURES}/{season}_figS_within_reference_anomaly',
-        4.0, 10.0, 'Frequency anomaly (% points)')
+        4.0, 10.0, 'Frequency change (%)', stipple_density=4)
 
 def supp_diff_grid(season, k, var_tag, thresh=None):
     if thresh is None:
@@ -1312,12 +1358,12 @@ def supp_diff_grid(season, k, var_tag, thresh=None):
              else 'period-specific thresholds')
     _type_by_cluster_grid(
         diffs, sig, wet_masked, k, labels,
-        f'{season.title()} compound-extreme frequency change by circulation '
+        f'{season.title()} compound-event frequency change by circulation '
         f'regime\n{LATER_YEARS[0]}\u2013{LATER_YEARS[1]} minus '
         f'{EARLY_YEARS[0]}\u2013{EARLY_YEARS[1]}, {label}\n',
         #'* = domain-mean change also significant',
         f'{FIGURES}/{season}_figS_diff_grid_{thresh}',
-        3.0, 6.0, 'Frequency change (%)', domain_sig=dsig)
+        3.0, 6.0, 'Frequency change (%)', domain_sig=dsig, stipple_density=3)
 
 def supp_change_ownclim(season, k, var_tag):
     figure3(season, k, var_tag, thresh='ownclim')
